@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Security Pulse collector every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=security-pulse.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,911 @@
+#!/usr/bin/env bash
+# Security Pulse collector.
+#
+# Probes user-visible security signals on this Arch + KDE box, pulls
+# four public threat feeds, cross-references CVEs against the local
+# package inventory, computes a composite risk score, and writes the
+# JSON the plasmoid and CLI read.
+#
+# Runs on a 5-minute systemd user timer. Nothing here needs root.
+#
+# Author: Kaspar Tavitian
+
+set -u
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/security-pulse"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/security-pulse"
+CONFIG_FILE="$CONFIG_DIR/config.toml"
+BASELINE_DIR="$CONFIG_DIR/baselines"
+mkdir -p "$STATE" "$BASELINE_DIR"
+
+LOG="$STATE/collector.log"
+HEALTH="$STATE/health.json"
+THREATS="$STATE/threats.json"
+RELEVANT="$STATE/relevant.json"
+INSTALLED="$STATE/installed.json"
+SCORE="$STATE/score.json"
+NOTIF_STATE="$STATE/notif-state.json"
+
+log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$LOG"; }
+
+trim_log() {
+    if [[ -f "$LOG" ]] && (( $(wc -l < "$LOG") > 2000 )); then
+        tail -1000 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+    fi
+}
+
+atomic_write() {
+    local path="$1"
+    cat > "$path.new" && mv "$path.new" "$path"
+}
+
+need_jq() {
+    if ! command -v jq >/dev/null 2>&1; then
+        log 'jq not on PATH'
+        return 1
+    fi
+}
+
+###############################################################################
+# Config
+###############################################################################
+
+# Plain key=value reader. Strips inline comments, trims whitespace,
+# refuses anything that looks like a shell metacharacter. Sets
+# CFG_<key> in the environment.
+load_config() {
+    # Defaults
+    CFG_feed_kev=true
+    CFG_feed_arch=true
+    CFG_feed_nvd=true
+    CFG_feed_ghsa=true
+    CFG_feed_epss=true
+    CFG_severity_threshold=high
+    CFG_notify_enabled=true
+    CFG_notify_cooldown_minutes=60
+    CFG_score_history_days=30
+    CFG_relevant_cap=50
+    CFG_kev_max_age_days=365
+    CFG_nvd_max_age_days=30
+    CFG_llm_endpoint=
+    CFG_llm_token=
+
+    [[ -r "$CONFIG_FILE" ]] || return 0
+    local line key val
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        line="${line%"${line##*[![:space:]]}"}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" ]] && continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        case "$key" in
+            feed_kev|feed_arch|feed_nvd|feed_ghsa|feed_epss\
+            |notify_enabled)
+                [[ "$val" == "true" || "$val" == "false" ]] && \
+                    eval "CFG_$key=\"\$val\""
+                ;;
+            severity_threshold)
+                case "$val" in
+                    low|medium|high|critical) CFG_severity_threshold="$val" ;;
+                esac
+                ;;
+            notify_cooldown_minutes|score_history_days|relevant_cap\
+            |kev_max_age_days|nvd_max_age_days)
+                [[ "$val" =~ ^[0-9]+$ ]] && eval "CFG_$key=\"\$val\""
+                ;;
+            llm_endpoint)
+                [[ "$val" =~ ^https?://[A-Za-z0-9./_\:-]+$ ]] && \
+                    CFG_llm_endpoint="$val"
+                ;;
+            llm_token)
+                [[ "$val" =~ ^[A-Za-z0-9._-]+$ ]] && CFG_llm_token="$val"
+                ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+# Severity numeric ranking, used for floor comparisons.
+sev_rank() {
+    case "$1" in
+        critical) echo 4 ;;
+        high)     echo 3 ;;
+        medium)   echo 2 ;;
+        low)      echo 1 ;;
+        *)        echo 0 ;;
+    esac
+}
+
+###############################################################################
+# Health probes
+###############################################################################
+
+probe_firewall() {
+    local engine='none' active=0
+    for unit in nftables.service iptables.service ip6tables.service firewalld.service ufw.service; do
+        if systemctl is-active --quiet "$unit"; then
+            engine="${unit%.service}"
+            active=1
+            break
+        fi
+    done
+    local severity='ok'
+    (( active == 0 )) && severity='critical'
+    printf '{"engine":"%s","active":%s,"severity":"%s"}' "$engine" "$active" "$severity"
+}
+
+probe_apparmor() {
+    local active=0
+    systemctl is-active --quiet apparmor.service && active=1
+    local sev='warn'
+    (( active == 1 )) && sev='ok'
+    printf '{"active":%s,"severity":"%s"}' "$active" "$sev"
+}
+
+probe_usbguard() {
+    local active=0 installed=0
+    command -v usbguard >/dev/null 2>&1 && installed=1
+    systemctl is-active --quiet usbguard.service && active=1
+    local sev='warn'
+    (( active == 1 )) && sev='ok'
+    (( installed == 0 )) && sev='info'
+    printf '{"installed":%s,"active":%s,"severity":"%s"}' "$installed" "$active" "$sev"
+}
+
+probe_updates() {
+    local total=0 kernel_pending=0
+    if command -v checkupdates >/dev/null 2>&1; then
+        local out
+        out=$(checkupdates 2>/dev/null || true)
+        total=$(printf '%s' "$out" | grep -c . || true)
+        printf '%s' "$out" | grep -q '^linux ' && kernel_pending=1
+    fi
+    local sev='ok'
+    (( total > 50 )) && sev='warn'
+    (( kernel_pending == 1 )) && sev='warn'
+    printf '{"total":%s,"kernel_pending":%s,"severity":"%s"}' "$total" "$kernel_pending" "$sev"
+}
+
+probe_secureboot() {
+    local sb='unknown'
+    if command -v bootctl >/dev/null 2>&1; then
+        if bootctl status 2>/dev/null | grep -qE 'Secure Boot: enabled'; then
+            sb='enabled'
+        elif bootctl status 2>/dev/null | grep -qE 'Secure Boot: disabled'; then
+            sb='disabled'
+        fi
+    fi
+    local sev='warn'
+    [[ $sb == 'enabled' ]] && sev='ok'
+    [[ $sb == 'unknown' ]] && sev='info'
+    printf '{"state":"%s","severity":"%s"}' "$sb" "$sev"
+}
+
+probe_tpm() {
+    local present=0
+    [[ -c /dev/tpm0 ]] && present=1
+    local sev='info'
+    (( present == 1 )) && sev='ok'
+    printf '{"present":%s,"severity":"%s"}' "$present" "$sev"
+}
+
+probe_luks() {
+    local has=0
+    lsblk -o FSTYPE 2>/dev/null | grep -q crypto_LUKS && has=1
+    local sev='warn'
+    (( has == 1 )) && sev='ok'
+    printf '{"present":%s,"severity":"%s"}' "$has" "$sev"
+}
+
+probe_failed_logins() {
+    local count=0
+    count=$(journalctl --since='24 hours ago' --no-pager 2>/dev/null \
+            | grep -cE 'authentication failure|Failed password|FAILED LOGIN' || true)
+    local sev='ok'
+    (( count > 5 ))  && sev='warn'
+    (( count > 20 )) && sev='critical'
+    printf '{"count_24h":%s,"severity":"%s"}' "$count" "$sev"
+}
+
+probe_listening_ports() {
+    local extern=0
+    if command -v ss >/dev/null 2>&1; then
+        extern=$(ss -H -tunlp 2>/dev/null | awk '{print $5}' \
+                 | grep -cE '^(0\.0\.0\.0|\[::\]):' || true)
+    fi
+    local sev='ok'
+    (( extern > 0 )) && sev='warn'
+    (( extern > 3 )) && sev='critical'
+    printf '{"external_listeners":%s,"severity":"%s"}' "$extern" "$sev"
+}
+
+probe_vpn() {
+    local active=0
+    if ip -o link show 2>/dev/null | grep -qE ': (proton[0-9]+|wg[0-9]+|tun[0-9]+|tailscale[0-9]+):'; then
+        active=1
+    fi
+    local sev='info'
+    (( active == 1 )) && sev='ok'
+    printf '{"active":%s,"severity":"%s"}' "$active" "$sev"
+}
+
+# Kernel staleness: days since the running kernel was packaged. Reads
+# the install date from pacman, not the upstream release date.
+probe_kernel_age() {
+    local days=0 running pkg ver
+    running=$(uname -r)
+    pkg="linux"
+    if pacman -Q linux-zen >/dev/null 2>&1; then pkg="linux-zen"; fi
+    if pacman -Q linux-lts >/dev/null 2>&1 && [[ $running == *-lts ]]; then pkg="linux-lts"; fi
+    ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}')
+    if [[ -n "$ver" ]]; then
+        local install_date
+        install_date=$(pacman -Qi "$pkg" 2>/dev/null | awk -F: '/^Install Date/ {sub(/^[ \t]+/,"",$0); print substr($0, index($0,$2))}' | sed 's/^[ \t]*//')
+        if [[ -n "$install_date" ]]; then
+            local secs
+            secs=$(date -d "$install_date" +%s 2>/dev/null || echo 0)
+            if (( secs > 0 )); then
+                days=$(( ( $(date +%s) - secs ) / 86400 ))
+            fi
+        fi
+    fi
+    local sev='ok'
+    (( days > 60 ))  && sev='warn'
+    (( days > 120 )) && sev='critical'
+    printf '{"running":"%s","package":"%s","installed_version":"%s","days_since_install":%s,"severity":"%s"}' \
+        "$running" "$pkg" "${ver:-unknown}" "$days" "$sev"
+}
+
+# SUID / SGID inventory, with delta against a baseline if one exists.
+probe_suid() {
+    local current count added removed baseline
+    baseline="$BASELINE_DIR/suid.txt"
+    current=$(find /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /opt -xdev \
+              \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null \
+              | LC_ALL=C sort -u)
+    count=$(printf '%s\n' "$current" | grep -c . || true)
+    added=0
+    removed=0
+    if [[ -s "$baseline" ]]; then
+        added=$(comm -23 <(printf '%s\n' "$current") "$baseline" 2>/dev/null | grep -c . || true)
+        removed=$(comm -13 <(printf '%s\n' "$current") "$baseline" 2>/dev/null | grep -c . || true)
+    fi
+    local sev='ok'
+    (( added > 0 ))  && sev='warn'
+    (( added > 3 ))  && sev='critical'
+    printf '{"count":%s,"added_since_baseline":%s,"removed_since_baseline":%s,"baseline_present":%s,"severity":"%s"}' \
+        "$count" "$added" "$removed" "$([[ -s $baseline ]] && echo true || echo false)" "$sev"
+}
+
+# SSH hardening: file present? PasswordAuthentication, PermitRootLogin.
+probe_ssh() {
+    local cfg=/etc/ssh/sshd_config password=unknown root=unknown installed=0
+    if [[ -r "$cfg" ]]; then
+        installed=1
+        if grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+no' "$cfg"; then password=no; \
+        elif grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' "$cfg"; then password=yes; fi
+        if grep -qE '^[[:space:]]*PermitRootLogin[[:space:]]+no' "$cfg"; then root=no; \
+        elif grep -qE '^[[:space:]]*PermitRootLogin[[:space:]]+(yes|prohibit-password|without-password)' "$cfg"; then root=yes; fi
+    fi
+    local sev='info'
+    [[ $installed -eq 1 ]] && sev='ok'
+    [[ $password == 'yes' ]] && sev='warn'
+    [[ $root == 'yes' ]] && sev='critical'
+    printf '{"sshd_present":%s,"password_auth":"%s","permit_root_login":"%s","severity":"%s"}' \
+        "$installed" "$password" "$root" "$sev"
+}
+
+# Days since the last full system upgrade. Reads pacman log for the
+# most recent "starting full system upgrade" event.
+probe_last_upgrade() {
+    local days=999 last
+    if [[ -r /var/log/pacman.log ]]; then
+        last=$(grep -aE 'starting full system upgrade' /var/log/pacman.log 2>/dev/null \
+               | tail -1 | sed -E 's/^\[([^]]+)\].*/\1/')
+        if [[ -n "$last" ]]; then
+            local secs
+            secs=$(date -d "$last" +%s 2>/dev/null || echo 0)
+            if (( secs > 0 )); then
+                days=$(( ( $(date +%s) - secs ) / 86400 ))
+            fi
+        fi
+    fi
+    local sev='ok'
+    (( days > 14 )) && sev='warn'
+    (( days > 30 )) && sev='critical'
+    printf '{"days":%s,"severity":"%s"}' "$days" "$sev"
+}
+
+# Aggregate to a worst severity.
+aggregate() {
+    local worst='ok' s
+    for s in "$@"; do
+        case "$s" in
+            critical) worst='critical' ;;
+            warn)     [[ $worst != 'critical' ]] && worst='warn' ;;
+            info)     [[ $worst == 'ok' ]] && worst='info' ;;
+        esac
+    done
+    printf '%s' "$worst"
+}
+
+###############################################################################
+# Threat feeds
+###############################################################################
+
+# CISA KEV.
+fetch_kev() {
+    [[ "$CFG_feed_kev" != true ]] && return 0
+    local out="$STATE/kev.json"
+    if curl -fsSL --max-time 20 \
+        'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json' \
+        -o "$out.new" 2>>"$LOG"; then
+        mv "$out.new" "$out"
+        log "kev fetch ok"
+        return 0
+    fi
+    log "kev fetch FAILED, keeping previous"
+    return 1
+}
+
+# Arch Linux Security Advisories.
+fetch_arch() {
+    [[ "$CFG_feed_arch" != true ]] && return 0
+    local out="$STATE/arch.json"
+    if curl -fsSL --max-time 20 \
+        'https://security.archlinux.org/issues/all.json' \
+        -o "$out.new" 2>>"$LOG"; then
+        mv "$out.new" "$out"
+        log "arch fetch ok"
+        return 0
+    fi
+    log "arch fetch FAILED, keeping previous"
+    return 1
+}
+
+# NVD recent CVEs: published in the last 7 days. JSON v2 API, no key
+# needed for low-volume reads. We page through the first 2000 results
+# at most, sized for a personal-machine workload.
+fetch_nvd() {
+    [[ "$CFG_feed_nvd" != true ]] && return 0
+    local out="$STATE/nvd.json"
+    local now seven_ago
+    now=$(date -u +%Y-%m-%dT%H:%M:%S.000)
+    seven_ago=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%S.000)
+    local url="https://services.nvd.nist.gov/rest/json/cves/2.0?pubStartDate=${seven_ago}&pubEndDate=${now}&resultsPerPage=2000"
+    if curl -fsSL --max-time 45 -A 'security-pulse/0.2' "$url" -o "$out.new" 2>>"$LOG"; then
+        mv "$out.new" "$out"
+        log "nvd fetch ok"
+        return 0
+    fi
+    log "nvd fetch FAILED, keeping previous"
+    return 1
+}
+
+# GitHub Security Advisories. Public endpoint, no auth for low-volume.
+fetch_ghsa() {
+    [[ "$CFG_feed_ghsa" != true ]] && return 0
+    local out="$STATE/ghsa.json"
+    if curl -fsSL --max-time 30 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        'https://api.github.com/advisories?type=reviewed&per_page=100' \
+        -o "$out.new" 2>>"$LOG"; then
+        mv "$out.new" "$out"
+        log "ghsa fetch ok"
+        return 0
+    fi
+    log "ghsa fetch FAILED, keeping previous"
+    return 1
+}
+
+# EPSS scores. Pulls scores for every CVE currently in the KEV catalogue;
+# this keeps the dataset bounded and immediately useful for the
+# exploited-in-the-wild bucket. Falls back to the latest top-100 if KEV
+# isn't yet available.
+fetch_epss() {
+    [[ "$CFG_feed_epss" != true ]] && return 0
+    local out="$STATE/epss.json"
+    local cves=
+    if [[ -s "$STATE/kev.json" ]]; then
+        cves=$(jq -r '[.vulnerabilities[].cveID] | join(",")' "$STATE/kev.json" 2>/dev/null | head -c 7000)
+    fi
+    local url
+    if [[ -n "$cves" ]]; then
+        url="https://api.first.org/data/v1/epss?cve=${cves}&limit=1000"
+    else
+        url="https://api.first.org/data/v1/epss?order=!epss&limit=200"
+    fi
+    if curl -fsSL --max-time 30 -A 'security-pulse/0.2' "$url" -o "$out.new" 2>>"$LOG"; then
+        mv "$out.new" "$out"
+        log "epss fetch ok"
+        return 0
+    fi
+    log "epss fetch FAILED, keeping previous"
+    return 1
+}
+
+###############################################################################
+# Installed-package inventory + relevance cross-reference
+###############################################################################
+
+snapshot_installed() {
+    if ! command -v pacman >/dev/null 2>&1; then
+        echo '[]' > "$INSTALLED"
+        return
+    fi
+    pacman -Q 2>/dev/null \
+      | awk '{print "{\"name\":\""$1"\",\"version\":\""$2"\"}"}' \
+      | jq -s '.' > "$INSTALLED.new" 2>>"$LOG" && mv "$INSTALLED.new" "$INSTALLED"
+}
+
+# Build a flat list of relevant CVEs across the four feeds. A CVE is
+# relevant if its package name matches one in the local pacman inventory.
+# Severity floor honoured. Output is capped.
+compute_relevant() {
+    local cap="$CFG_relevant_cap"
+    local floor_rank
+    floor_rank=$(sev_rank "$CFG_severity_threshold")
+
+    local installed_names
+    installed_names=$(jq -r '.[].name' "$INSTALLED" 2>/dev/null | LC_ALL=C sort -u)
+
+    if [[ -z "$installed_names" ]]; then
+        echo '{"updated":"'"$(date -Iseconds)"'","items":[]}' > "$RELEVANT.new"
+        mv "$RELEVANT.new" "$RELEVANT"
+        return
+    fi
+
+    # Arch ALSA items map cleanly onto pacman package names.
+    local arch_items='[]'
+    if [[ -s "$STATE/arch.json" ]]; then
+        arch_items=$(jq --argjson floor "$floor_rank" \
+            --slurpfile inst <(jq '[.[].name]' "$INSTALLED") \
+            '
+            def sev_rank(s):
+                if s == "Critical" then 4
+                elif s == "High"     then 3
+                elif s == "Medium"   then 2
+                elif s == "Low"      then 1
+                else 0 end;
+            [.[] | select(.packages != null)
+                | . as $a
+                | .packages[]
+                | select((($inst[0]) | index(.)) != null) as $pkg
+                | select(sev_rank($a.severity) >= $floor)
+                | {
+                    source: "arch",
+                    id: $a.name,
+                    package: $pkg,
+                    severity: ($a.severity // "Unknown"),
+                    status: ($a.status // "Unknown"),
+                    advisories: ($a.advisories // []),
+                    cves: ($a.issues // []),
+                    title: ($a.type // $a.name),
+                    url: ("https://security.archlinux.org/" + $a.name)
+                  }
+            ]
+            ' "$STATE/arch.json" 2>>"$LOG" || echo '[]')
+    fi
+
+    # KEV: known-exploited. Match on vendor or product equal to (or
+    # whose tokenised form contains) the installed package name. We
+    # require package names >= 4 chars and word-boundary equality to
+    # avoid spurious matches like "go" in "Google". Older-than-cutoff
+    # entries are out of the relevance bucket (still queryable via
+    # `security-pulse cves --kev`).
+    local kev_cutoff
+    kev_cutoff=$(date -u -d "$CFG_kev_max_age_days days ago" +%Y-%m-%d)
+    local kev_items='[]'
+    if [[ -s "$STATE/kev.json" ]]; then
+        kev_items=$(jq \
+            --arg cutoff "$kev_cutoff" \
+            --slurpfile inst <(jq '[.[].name | select(length >= 4)]' "$INSTALLED") \
+            '
+            def tokens(s):
+                (s // "") | ascii_downcase
+                | gsub("[^a-z0-9]+"; " ")
+                | split(" ") | map(select(length > 0)) | unique;
+            [.vulnerabilities[]
+                | select((.dateAdded // "1970-01-01") >= $cutoff)
+                | . as $v
+                | (tokens($v.product) + tokens($v.vendorProject)) as $toks
+                | (($inst[0]) | map(select((. | ascii_downcase) as $p | ($toks | index($p)) != null))) as $hits
+                | select(($hits | length) > 0)
+                | {
+                    source: "kev",
+                    id: $v.cveID,
+                    package: $hits[0],
+                    severity: "Critical",
+                    status: "KnownExploited",
+                    advisories: [$v.cveID],
+                    cves: [$v.cveID],
+                    title: $v.vulnerabilityName,
+                    vendor: $v.vendorProject,
+                    product: $v.product,
+                    added: $v.dateAdded,
+                    ransomware: $v.knownRansomwareCampaignUse,
+                    url: ("https://nvd.nist.gov/vuln/detail/" + $v.cveID)
+                  }
+            ]
+            ' "$STATE/kev.json" 2>>"$LOG" || echo '[]')
+    fi
+
+    # NVD recent: match against the structured CPE product strings in
+    # the cve.configurations tree, not free-text description. Same
+    # word-boundary rule. Published-before-cutoff entries dropped.
+    local nvd_cutoff
+    nvd_cutoff=$(date -u -d "$CFG_nvd_max_age_days days ago" +%Y-%m-%dT%H:%M:%S)
+    local nvd_items='[]'
+    if [[ -s "$STATE/nvd.json" ]]; then
+        nvd_items=$(jq --argjson floor "$floor_rank" \
+            --arg cutoff "$nvd_cutoff" \
+            --slurpfile inst <(jq '[.[].name | select(length >= 4)]' "$INSTALLED") \
+            '
+            def sev_rank(s):
+                if (s // "") | ascii_downcase | startswith("crit") then 4
+                elif (s // "") | ascii_downcase | startswith("high") then 3
+                elif (s // "") | ascii_downcase | startswith("med") then 2
+                elif (s // "") | ascii_downcase | startswith("low") then 1
+                else 0 end;
+            [.vulnerabilities[]? | .cve as $c
+                | select(($c.published // "1970") >= $cutoff)
+                | (($c.metrics.cvssMetricV31 // [])[0].cvssData.baseSeverity // "") as $sev
+                | select(sev_rank($sev) >= $floor)
+                | (
+                    [($c.configurations // [])[]? | .nodes[]? | .cpeMatch[]? | .criteria // empty]
+                    | map(split(":")) | map(select(length >= 5)) | map(.[4])
+                    | map(ascii_downcase) | unique
+                  ) as $cpe_products
+                | (($inst[0]) | map(select((. | ascii_downcase) as $p | ($cpe_products | index($p)) != null))) as $hits
+                | select(($hits | length) > 0)
+                | {
+                    source: "nvd",
+                    id: $c.id,
+                    package: $hits[0],
+                    severity: $sev,
+                    status: "Disclosed",
+                    advisories: [$c.id],
+                    cves: [$c.id],
+                    title: (($c.descriptions // [])[0].value // $c.id),
+                    url: ("https://nvd.nist.gov/vuln/detail/" + $c.id),
+                    published: $c.published
+                  }
+            ]
+            ' "$STATE/nvd.json" 2>>"$LOG" || echo '[]')
+    fi
+
+    # Merge, de-dup by id+package, sort by severity then recency, cap.
+    local items
+    items=$(jq -s --argjson cap "$cap" \
+        '
+        def sev_score(s):
+            if (s | ascii_downcase) | startswith("crit") then 4
+            elif (s | ascii_downcase) | startswith("high") then 3
+            elif (s | ascii_downcase) | startswith("med") then 2
+            elif (s | ascii_downcase) | startswith("low") then 1
+            else 0 end;
+        (.[0] + .[1] + .[2])
+        | group_by(.id + "|" + .package)
+        | map(.[0])
+        | sort_by(- sev_score(.severity), -((.added // .published // "") | tostring | length))
+        | .[0:$cap]
+        ' <(printf '%s' "$arch_items") <(printf '%s' "$kev_items") <(printf '%s' "$nvd_items") 2>>"$LOG" || echo '[]')
+
+    # Splice EPSS probabilities onto matching CVE rows.
+    if [[ -s "$STATE/epss.json" ]]; then
+        items=$(jq -s \
+            '
+            (.[1].data // []) as $epss
+            | (reduce $epss[] as $e ({}; . + {($e.cve): {epss: ($e.epss | tonumber), percentile: ($e.percentile | tonumber)}})) as $by_cve
+            | (.[0] | map(. + (($by_cve[(.cves // [.id])[0]]) // {})))
+            ' <(printf '%s' "$items") "$STATE/epss.json" 2>>"$LOG" || printf '%s' "$items")
+    fi
+
+    jq -n --argjson items "$items" --arg ts "$(date -Iseconds)" \
+        --arg floor "$CFG_severity_threshold" \
+        '{updated:$ts, severity_floor:$floor, count:($items | length), items:$items}' \
+        > "$RELEVANT.new" && mv "$RELEVANT.new" "$RELEVANT"
+}
+
+###############################################################################
+# Composite risk score + history
+###############################################################################
+
+# 0 (worst) to 100 (best). Combines local health, count of relevant
+# unresolved CVEs weighted by severity, kernel age, days since upgrade,
+# and listening-port surface.
+compose_score() {
+    local health_score=0
+    [[ -s "$HEALTH" ]] && health_score=$(jq -r '.score // 0' "$HEALTH")
+
+    local n_crit n_high n_med
+    n_crit=0; n_high=0; n_med=0
+    if [[ -s "$RELEVANT" ]]; then
+        n_crit=$(jq -r '[.items[] | select((.severity // "" | ascii_downcase) | startswith("crit"))] | length' "$RELEVANT")
+        n_high=$(jq -r '[.items[] | select((.severity // "" | ascii_downcase) | startswith("high"))] | length' "$RELEVANT")
+        n_med=$(jq -r  '[.items[] | select((.severity // "" | ascii_downcase) | startswith("med"))]  | length' "$RELEVANT")
+    fi
+    local cve_penalty=$(( n_crit * 8 + n_high * 4 + n_med * 1 ))
+    (( cve_penalty > 60 )) && cve_penalty=60
+
+    local final=$(( health_score - cve_penalty ))
+    (( final < 0 ))   && final=0
+    (( final > 100 )) && final=100
+
+    # Append to rolling history.
+    local now_iso ts hist days_cap
+    now_iso=$(date -Iseconds)
+    ts=$(date +%s)
+    days_cap="$CFG_score_history_days"
+    local cutoff=$(( ts - days_cap * 86400 ))
+    hist='[]'
+    [[ -s "$SCORE" ]] && hist=$(jq -c '.history // []' "$SCORE")
+
+    jq -n \
+        --arg now "$now_iso" \
+        --argjson score "$final" \
+        --argjson health "$health_score" \
+        --argjson crit "$n_crit" \
+        --argjson high "$n_high" \
+        --argjson med "$n_med" \
+        --argjson hist "$hist" \
+        --argjson cutoff "$cutoff" \
+        '
+        ($hist + [{at:$now, score:$score, ts:(now | floor)}])
+        | map(select(.ts >= $cutoff))
+        | sort_by(.ts)
+        | { updated:$now,
+            score:$score,
+            health_score:$health,
+            relevant: {critical:$crit, high:$high, medium:$med},
+            history: . }
+        ' > "$SCORE.new" && mv "$SCORE.new" "$SCORE"
+}
+
+###############################################################################
+# Notifications
+###############################################################################
+
+# Fires a desktop notification when a new critical-or-higher relevant
+# CVE appears that wasn't there on the previous run. Respects the
+# cooldown.
+maybe_notify() {
+    [[ "$CFG_notify_enabled" != true ]] && return 0
+    [[ -s "$RELEVANT" ]] || return 0
+    command -v notify-send >/dev/null 2>&1 || return 0
+
+    local floor_rank
+    floor_rank=$(sev_rank "$CFG_severity_threshold")
+
+    local current_ids
+    current_ids=$(jq -r --argjson floor "$floor_rank" '
+        def sev_rank(s):
+            if (s // "" | ascii_downcase) | startswith("crit") then 4
+            elif (s // "" | ascii_downcase) | startswith("high") then 3
+            elif (s // "" | ascii_downcase) | startswith("med")  then 2
+            elif (s // "" | ascii_downcase) | startswith("low")  then 1
+            else 0 end;
+        [.items[] | select(sev_rank(.severity) >= $floor) | (.id + "|" + .package)] | sort | unique | .[]
+    ' "$RELEVANT" 2>/dev/null)
+
+    local prev_ids='' last_at=0
+    if [[ -s "$NOTIF_STATE" ]]; then
+        prev_ids=$(jq -r '.seen[]?' "$NOTIF_STATE" 2>/dev/null)
+        last_at=$(jq -r '.last_fired // 0' "$NOTIF_STATE" 2>/dev/null)
+    fi
+
+    local newly
+    newly=$(comm -23 <(printf '%s\n' "$current_ids" | sort -u) <(printf '%s\n' "$prev_ids" | sort -u) 2>/dev/null | grep -c . || true)
+
+    local now_ts cooldown_secs
+    now_ts=$(date +%s)
+    cooldown_secs=$(( CFG_notify_cooldown_minutes * 60 ))
+
+    if (( newly > 0 )) && (( now_ts - last_at > cooldown_secs )); then
+        local summary
+        summary=$(jq -r --argjson floor "$floor_rank" '
+            def sev_rank(s):
+                if (s // "" | ascii_downcase) | startswith("crit") then 4
+                elif (s // "" | ascii_downcase) | startswith("high") then 3
+                else 0 end;
+            [.items[] | select(sev_rank(.severity) >= $floor)] | .[0:3] |
+            map((.severity[0:1] | ascii_upcase) + " " + .id + " on " + .package) | join(" \n ")
+        ' "$RELEVANT" 2>/dev/null)
+        notify-send -a 'Security Pulse' -i security-high -u critical \
+            "$newly new vulnerability alert(s)" "$summary" 2>>"$LOG" || true
+        last_at="$now_ts"
+    fi
+
+    jq -n --argjson last "$last_at" --arg list "$current_ids" \
+        '{last_fired:$last, seen:($list | split("\n") | map(select(length>0)))}' \
+        > "$NOTIF_STATE.new" && mv "$NOTIF_STATE.new" "$NOTIF_STATE"
+}
+
+###############################################################################
+# Hugo briefing (optional)
+###############################################################################
+
+maybe_brief() {
+    [[ -n "$CFG_llm_endpoint" && -n "$CFG_llm_token" ]] || return 0
+    [[ -s "$RELEVANT" ]] || return 0
+
+    local payload
+    payload=$(jq -c '{
+        ask: "Three sentences. Plain English. Worst-first. What should the user fix on this machine today, given this Security Pulse snapshot? No marketing language.",
+        snapshot: {
+            score: (input | .score),
+            health: (input | .items),
+            top_relevant: (input | .items[0:5])
+        }
+    }' "$SCORE" <(jq '{score:.score, items:.items[0:0]}' "$SCORE") "$RELEVANT" 2>>"$LOG" || echo '{}')
+
+    curl -fsSL --max-time 25 -X POST \
+        -H "Authorization: Bearer $CFG_llm_token" \
+        -H 'Content-Type: application/json' \
+        -d "$payload" \
+        "$CFG_llm_endpoint" -o "$STATE/briefing.json.new" 2>>"$LOG" \
+        && mv "$STATE/briefing.json.new" "$STATE/briefing.json"
+}
+
+###############################################################################
+# Compose JSON
+###############################################################################
+
+write_health() {
+    local fw aa ug up sb tpm luks fl lp vpn kern suid ssh upg
+    fw=$(probe_firewall)
+    aa=$(probe_apparmor)
+    ug=$(probe_usbguard)
+    up=$(probe_updates)
+    sb=$(probe_secureboot)
+    tpm=$(probe_tpm)
+    luks=$(probe_luks)
+    fl=$(probe_failed_logins)
+    lp=$(probe_listening_ports)
+    vpn=$(probe_vpn)
+    kern=$(probe_kernel_age)
+    suid=$(probe_suid)
+    ssh=$(probe_ssh)
+    upg=$(probe_last_upgrade)
+
+    local sevs=()
+    for j in "$fw" "$aa" "$ug" "$up" "$sb" "$tpm" "$luks" "$fl" "$lp" "$vpn" "$kern" "$suid" "$ssh" "$upg"; do
+        sevs+=("$(printf '%s' "$j" | jq -r .severity)")
+    done
+    local overall
+    overall=$(aggregate "${sevs[@]}")
+
+    # Each ok=10, info=8, warn=5, critical=0; normalised to 100.
+    local raw=0 count=${#sevs[@]} s
+    for s in "${sevs[@]}"; do
+        case "$s" in
+            ok)       raw=$((raw+10)) ;;
+            info)     raw=$((raw+8)) ;;
+            warn)     raw=$((raw+5)) ;;
+            critical) ;;
+        esac
+    done
+    local score=$(( raw * 100 / (count * 10) ))
+
+    jq -n \
+        --argjson firewall "$fw" \
+        --argjson apparmor "$aa" \
+        --argjson usbguard "$ug" \
+        --argjson updates "$up" \
+        --argjson secureboot "$sb" \
+        --argjson tpm "$tpm" \
+        --argjson luks "$luks" \
+        --argjson failedlogins "$fl" \
+        --argjson listeners "$lp" \
+        --argjson vpn "$vpn" \
+        --argjson kernel "$kern" \
+        --argjson suid "$suid" \
+        --argjson ssh "$ssh" \
+        --argjson upgrade "$upg" \
+        --arg overall "$overall" \
+        --argjson score "$score" \
+        --arg ts "$(date -Iseconds)" \
+        --arg host "$(hostname)" \
+        '{updated:$ts, overall:$overall, score:$score, host:$host,
+          items:{
+            firewall:$firewall, apparmor:$apparmor, usbguard:$usbguard,
+            updates:$updates, secureboot:$secureboot, tpm:$tpm, luks:$luks,
+            failed_logins:$failedlogins, listening_ports:$listeners,
+            vpn:$vpn, kernel:$kernel, suid:$suid, ssh:$ssh,
+            last_upgrade:$upgrade
+          }}' \
+        > "$HEALTH.new" && mv "$HEALTH.new" "$HEALTH"
+}
+
+write_threats() {
+    local kev_file="$STATE/kev.json"
+    local arch_file="$STATE/arch.json"
+    local nvd_file="$STATE/nvd.json"
+    local ghsa_file="$STATE/ghsa.json"
+    local kev_summary='null' arch_summary='null' nvd_summary='null' ghsa_summary='null'
+
+    if [[ -s $kev_file ]]; then
+        kev_summary=$(jq '{
+            total: (.vulnerabilities | length),
+            new_week: ([.vulnerabilities[] | select(.dateAdded >= (now - 86400*7 | strftime("%Y-%m-%d")))] | length),
+            recent: ([.vulnerabilities[] | {cve: .cveID, vendor: .vendorProject, product: .product, name: .vulnerabilityName, added: .dateAdded, ransomware: .knownRansomwareCampaignUse}] | sort_by(.added) | reverse | .[0:8])
+        }' "$kev_file" 2>>"$LOG" || echo 'null')
+    fi
+
+    if [[ -s $arch_file ]]; then
+        arch_summary=$(jq '{
+            total: length,
+            new_week: ([.[] | select(.status == "Vulnerable" or .status == "Unknown")] | length),
+            recent: ([.[] | {id: .name, packages: .packages, severity: .severity, status: .status}] | sort_by(.id) | reverse | .[0:8])
+        }' "$arch_file" 2>>"$LOG" || echo 'null')
+    fi
+
+    if [[ -s $nvd_file ]]; then
+        nvd_summary=$(jq '{
+            total: (.totalResults // (.vulnerabilities | length)),
+            recent: ([.vulnerabilities[]? | .cve | {
+                id: .id,
+                published: .published,
+                severity: ((.metrics.cvssMetricV31 // [])[0].cvssData.baseSeverity // "Unknown"),
+                title: ((.descriptions // [])[0].value // .id)
+            }] | sort_by(.published) | reverse | .[0:8])
+        }' "$nvd_file" 2>>"$LOG" || echo 'null')
+    fi
+
+    if [[ -s $ghsa_file ]]; then
+        ghsa_summary=$(jq '{
+            total: length,
+            recent: ([.[] | {
+                id: .ghsa_id,
+                cve: .cve_id,
+                severity: .severity,
+                summary: .summary,
+                published: .published_at,
+                url: .html_url
+            }] | sort_by(.published) | reverse | .[0:8])
+        }' "$ghsa_file" 2>>"$LOG" || echo 'null')
+    fi
+
+    jq -n \
+        --argjson kev "$kev_summary" \
+        --argjson arch "$arch_summary" \
+        --argjson nvd "$nvd_summary" \
+        --argjson ghsa "$ghsa_summary" \
+        --arg ts "$(date -Iseconds)" \
+        '{updated:$ts, kev:$kev, arch:$arch, nvd:$nvd, ghsa:$ghsa}' \
+        > "$THREATS.new" && mv "$THREATS.new" "$THREATS"
+}
+
+###############################################################################
+# Main
+###############################################################################
+
+main() {
+    need_jq || exit 1
+    load_config
+    log "collector run start (severity floor: $CFG_severity_threshold)"
+
+    snapshot_installed
+
+    fetch_kev  || true
+    fetch_arch || true
+    fetch_nvd  || true
+    fetch_ghsa || true
+    fetch_epss || true
+
+    write_health
+    write_threats
+    compute_relevant
+    compose_score
+    maybe_notify
+    maybe_brief
+
+    log "run done: overall=$(jq -r .overall "$HEALTH") health=$(jq -r .score "$HEALTH")/100 composite=$(jq -r .score "$SCORE")/100 relevant=$(jq -r .count "$RELEVANT")"
+    trim_log
+}
+
+main "$@"

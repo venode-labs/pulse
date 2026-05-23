@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+# Security Pulse command-line interface.
+#
+# Read-only shell over the JSON the collector writes. Lets you check
+# status, list CVEs that match installed packages, edit config, and
+# manage the SUID baseline without leaving the terminal.
+#
+# Author: Kaspar Tavitian
+
+set -u
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/security-pulse"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/security-pulse"
+CONFIG_FILE="$CONFIG_DIR/config.toml"
+COLLECTOR="$HOME/.local/bin/security-pulse-collector"
+BASELINE_DIR="$CONFIG_DIR/baselines"
+
+VERSION='0.2.0'
+
+C_RESET=$'\e[0m'
+C_BOLD=$'\e[1m'
+C_DIM=$'\e[2m'
+C_RED=$'\e[31m'
+C_AMBER=$'\e[33m'
+C_GREEN=$'\e[32m'
+C_BLUE=$'\e[34m'
+
+if [[ ! -t 1 ]] || [[ "${NO_COLOR:-}" != "" ]]; then
+    C_RESET=''; C_BOLD=''; C_DIM=''; C_RED=''; C_AMBER=''; C_GREEN=''; C_BLUE=''
+fi
+
+sev_colour() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        critical|crit) printf '%s' "$C_RED" ;;
+        high)          printf '%s' "$C_RED" ;;
+        warn|medium|med) printf '%s' "$C_AMBER" ;;
+        info|low)      printf '%s' "$C_BLUE" ;;
+        ok)            printf '%s' "$C_GREEN" ;;
+        *)             printf '%s' "$C_DIM" ;;
+    esac
+}
+
+require_jq() {
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "security-pulse: jq is required (pacman -S jq)" >&2
+        exit 1
+    fi
+}
+
+require_state() {
+    if [[ ! -s "$STATE/health.json" ]]; then
+        echo "security-pulse: no state yet. Run 'security-pulse run' or wait for the timer."
+        exit 1
+    fi
+}
+
+###############################################################################
+# Sub-commands
+###############################################################################
+
+cmd_status() {
+    require_jq
+    require_state
+    local sc he sev host updated comp relevant
+    sc=$(jq -r '.score // 0' "$STATE/score.json" 2>/dev/null || echo 0)
+    he=$(jq -r '.score // 0' "$STATE/health.json")
+    sev=$(jq -r '.overall // "unknown"' "$STATE/health.json")
+    host=$(jq -r '.host // "?"' "$STATE/health.json")
+    updated=$(jq -r '.updated // ""' "$STATE/health.json")
+    comp="$(sev_colour "$sev")"
+    relevant=$(jq -r '.count // 0' "$STATE/relevant.json" 2>/dev/null || echo 0)
+
+    printf '%s%sSecurity Pulse%s   %s%s%s\n' "$C_BOLD" "" "$C_RESET" \
+        "$comp" "$(printf '%s\n' "$sev" | tr '[:lower:]' '[:upper:]')" "$C_RESET"
+    printf '  host             %s\n' "$host"
+    printf '  composite score  %s%s/100%s\n' "$comp" "$sc" "$C_RESET"
+    printf '  health score     %s/100\n' "$he"
+    printf '  relevant CVEs    %s\n' "$relevant"
+    printf '  last collected   %s\n' "${updated:0:19}"
+    printf '\n'
+
+    cmd_health --short
+}
+
+cmd_health() {
+    require_jq
+    require_state
+    local short=0
+    [[ "${1:-}" == --short ]] && short=1
+    local rows
+    rows=$(jq -r '
+        .items
+        | to_entries
+        | sort_by(.key)
+        | .[]
+        | "\(.key)\t\(.value.severity)\t\(.value | del(.severity) | tojson)"
+    ' "$STATE/health.json")
+
+    while IFS=$'\t' read -r key sev rest; do
+        local label_color
+        label_color=$(sev_colour "$sev")
+        printf '  %s%-18s%s  %s%-8s%s  %s\n' \
+            "$C_BOLD" "$key" "$C_RESET" \
+            "$label_color" "$sev" "$C_RESET" \
+            "$(short_detail "$key" "$rest")"
+    done <<< "$rows"
+
+    (( short == 1 )) && return
+    printf '\n'
+}
+
+short_detail() {
+    local key="$1"; shift
+    local j="$*"
+    case "$key" in
+        firewall)        jq -r '"\(.engine) " + (if .active==1 then "active" else "inactive" end)' <<< "$j" ;;
+        apparmor)        jq -r 'if .active==1 then "enforcing" else "inactive" end' <<< "$j" ;;
+        usbguard)        jq -r 'if .installed==1 then (if .active==1 then "active" else "installed, off" end) else "not installed" end' <<< "$j" ;;
+        updates)         jq -r '"\(.total) pending" + (if .kernel_pending==1 then ", kernel" else "" end)' <<< "$j" ;;
+        secureboot)      jq -r '.state' <<< "$j" ;;
+        tpm)             jq -r 'if .present==1 then "present" else "absent" end' <<< "$j" ;;
+        luks)            jq -r 'if .present==1 then "encrypted volume present" else "no LUKS volume" end' <<< "$j" ;;
+        failed_logins)   jq -r '"\(.count_24h) in 24h"' <<< "$j" ;;
+        listening_ports) jq -r '"\(.external_listeners) external listener(s)"' <<< "$j" ;;
+        vpn)             jq -r 'if .active==1 then "tunnel up" else "no tunnel" end' <<< "$j" ;;
+        kernel)          jq -r '"\(.running), installed \(.days_since_install)d ago"' <<< "$j" ;;
+        suid)            jq -r '"\(.count) suid bins, +\(.added_since_baseline) / -\(.removed_since_baseline) since baseline"' <<< "$j" ;;
+        ssh)             jq -r 'if .sshd_present==1 then "sshd present (password=\(.password_auth), root=\(.permit_root_login))" else "no sshd" end' <<< "$j" ;;
+        last_upgrade)    jq -r '"\(.days) days since last -Syu"' <<< "$j" ;;
+        *)               printf '%s' "$j" ;;
+    esac
+}
+
+cmd_score() {
+    require_jq
+    require_state
+    [[ -s "$STATE/score.json" ]] || { echo "no score history yet"; exit 1; }
+    local sc he n_c n_h n_m hist_len
+    sc=$(jq -r '.score' "$STATE/score.json")
+    he=$(jq -r '.health_score' "$STATE/score.json")
+    n_c=$(jq -r '.relevant.critical' "$STATE/score.json")
+    n_h=$(jq -r '.relevant.high' "$STATE/score.json")
+    n_m=$(jq -r '.relevant.medium' "$STATE/score.json")
+    hist_len=$(jq -r '.history | length' "$STATE/score.json")
+
+    printf '%sComposite%s   %s/100\n' "$C_BOLD" "$C_RESET" "$sc"
+    printf '%sHealth%s      %s/100\n' "$C_BOLD" "$C_RESET" "$he"
+    printf '%sRelevant%s    %scritical %s%s   %shigh %s%s   %smedium %s%s\n' \
+        "$C_BOLD" "$C_RESET" \
+        "$C_RED" "$n_c" "$C_RESET" \
+        "$C_AMBER" "$n_h" "$C_RESET" \
+        "$C_BLUE" "$n_m" "$C_RESET"
+    printf '%sHistory%s     %s samples over the past %s days\n' \
+        "$C_BOLD" "$C_RESET" "$hist_len" "$(grep -E '^score_history_days' "$CONFIG_FILE" 2>/dev/null | awk -F= '{gsub(/[ ]/,"",$2); print $2}')"
+
+    # ASCII sparkline of the last 60 history points.
+    local marks=(' ' '▁' '▂' '▃' '▄' '▅' '▆' '▇' '█')
+    local values
+    values=$(jq -r '.history | .[-60:] | .[].score' "$STATE/score.json")
+    if [[ -n "$values" ]]; then
+        local line=
+        while read -r v; do
+            local idx=$(( v * 8 / 100 ))
+            (( idx < 0 )) && idx=0
+            (( idx > 8 )) && idx=8
+            line+="${marks[$idx]}"
+        done <<< "$values"
+        printf '\n  %s\n' "$line"
+    fi
+}
+
+cmd_cves() {
+    require_jq
+    require_state
+    local mode='relevant'
+    case "${1:-}" in
+        --all)      mode='all' ;;
+        --kev)      mode='kev' ;;
+        --relevant) mode='relevant' ;;
+        '')         ;;
+        *)          echo "usage: security-pulse cves [--relevant|--all|--kev]"; exit 2 ;;
+    esac
+
+    case "$mode" in
+        relevant)
+            jq -r '
+                .items // []
+                | sort_by(
+                    -(if (.severity // "" | ascii_downcase) | startswith("crit") then 4
+                      elif (.severity // "" | ascii_downcase) | startswith("high") then 3
+                      elif (.severity // "" | ascii_downcase) | startswith("med")  then 2
+                      else 1 end)
+                  )
+                | .[] | "\(.severity // "?")\t\(.id)\t\(.package // "?")\t\(.title // .id)\t\(.url // "")"
+            ' "$STATE/relevant.json" \
+              | while IFS=$'\t' read -r sev id pkg title url; do
+                    local c
+                    c=$(sev_colour "$sev")
+                    printf '%s%-9s%s  %s%-18s%s  %s\n' "$c" "$sev" "$C_RESET" \
+                        "$C_BOLD" "$id" "$C_RESET" "$pkg"
+                    printf '          %s%s%s\n' "$C_DIM" "$title" "$C_RESET"
+                    [[ -n "$url" ]] && printf '          %s%s%s\n' "$C_DIM" "$url" "$C_RESET"
+                    printf '\n'
+                done
+            ;;
+        kev)
+            jq -r '.kev.recent[]? | "\(.added)\t\(.cve)\t\(.vendor)\t\(.product)\t\(.name)"' \
+                "$STATE/threats.json" \
+              | while IFS=$'\t' read -r added id vendor product name; do
+                    printf '%s%-12s%s  %s%-18s%s  %s · %s\n' "$C_DIM" "$added" "$C_RESET" \
+                        "$C_BOLD" "$id" "$C_RESET" "$vendor" "$product"
+                    printf '          %s\n\n' "$name"
+                done
+            ;;
+        all)
+            jq -r '
+                ( (.kev.recent  // []) | map(. + {source:"KEV"})) +
+                ( (.arch.recent // []) | map(. + {source:"ALSA"})) +
+                ( (.nvd.recent  // []) | map(. + {source:"NVD"})) +
+                ( (.ghsa.recent // []) | map(. + {source:"GHSA"}))
+                | .[] | "\(.source)\t\(.severity // "?")\t\(.cve // .id)\t\(.product // (.packages // [""])[0] // "?")\t\(.name // .summary // .title // "")"
+            ' "$STATE/threats.json" \
+              | while IFS=$'\t' read -r src sev id pkg title; do
+                    local c
+                    c=$(sev_colour "$sev")
+                    printf '%s%-5s%s  %s%-9s%s  %s%-18s%s  %s\n' \
+                        "$C_DIM" "$src" "$C_RESET" \
+                        "$c" "$sev" "$C_RESET" \
+                        "$C_BOLD" "$id" "$C_RESET" \
+                        "$pkg"
+                    printf '          %s\n\n' "$title"
+                done
+            ;;
+    esac
+}
+
+cmd_feeds() {
+    require_jq
+    require_state
+    printf '%-6s  %-26s  %s\n' SOURCE LAST FILE
+    local f
+    for f in kev arch nvd ghsa epss; do
+        local p="$STATE/$f.json"
+        if [[ -s "$p" ]]; then
+            local m
+            m=$(stat -c '%y' "$p" 2>/dev/null | cut -c1-19)
+            printf '%-6s  %-26s  %s\n' "$f" "$m" "$p"
+        else
+            printf '%-6s  %-26s  %s\n' "$f" "(no data)" "$p"
+        fi
+    done
+}
+
+cmd_report() {
+    require_jq
+    require_state
+    local host updated sc sev rc rh rm
+    host=$(jq -r .host "$STATE/health.json")
+    updated=$(jq -r .updated "$STATE/health.json")
+    sc=$(jq -r '.score // 0' "$STATE/score.json")
+    sev=$(jq -r .overall "$STATE/health.json")
+    rc=$(jq -r '.relevant.critical' "$STATE/score.json")
+    rh=$(jq -r '.relevant.high' "$STATE/score.json")
+    rm=$(jq -r '.relevant.medium' "$STATE/score.json")
+
+    cat <<EOF
+# Security Pulse report
+
+Host: $host
+Collected: $updated
+Composite: $sc / 100
+Overall: $sev
+Relevant CVEs: $rc critical, $rh high, $rm medium
+
+## Local health
+
+EOF
+    jq -r '
+        .items
+        | to_entries
+        | sort_by(.key)
+        | .[]
+        | "- **\(.key)** [\(.value.severity)] " + (.value | del(.severity) | tojson)
+    ' "$STATE/health.json"
+
+    cat <<EOF
+
+## Top relevant CVEs
+
+EOF
+    jq -r '
+        .items // []
+        | .[0:20]
+        | .[]
+        | "- **\(.severity // "?")** \(.id) on \(.package). \(.title // .id)" +
+          (if .url then " (\(.url))" else "" end)
+    ' "$STATE/relevant.json"
+}
+
+cmd_set_baseline() {
+    install -d "$BASELINE_DIR"
+    local baseline="$BASELINE_DIR/suid.txt"
+    find /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /opt -xdev \
+         \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null \
+         | LC_ALL=C sort -u > "$baseline"
+    echo "baselined $(wc -l < "$baseline") suid binaries to $baseline"
+    "$COLLECTOR" 2>/dev/null || true
+}
+
+cmd_notify_test() {
+    if ! command -v notify-send >/dev/null 2>&1; then
+        echo "notify-send not on PATH (pacman -S libnotify)" >&2
+        exit 1
+    fi
+    notify-send -a 'Security Pulse' -i security-high -u normal \
+        'Security Pulse test' 'Notifications are wired and visible.'
+    echo "test notification fired"
+}
+
+cmd_config() {
+    if [[ "${1:-}" == --path ]]; then
+        echo "$CONFIG_FILE"
+        return
+    fi
+    if [[ "${1:-}" == --edit ]]; then
+        "${EDITOR:-nano}" "$CONFIG_FILE"
+        return
+    fi
+    cat "$CONFIG_FILE"
+}
+
+cmd_run() {
+    "$COLLECTOR"
+}
+
+cmd_version() {
+    echo "security-pulse $VERSION"
+}
+
+cmd_help() {
+    cat <<'EOF'
+security-pulse, local view onto your Security Pulse state.
+
+usage:
+  security-pulse [command] [args]
+
+commands:
+  status                  one-line score plus the local health rundown (default)
+  health                  full local health detail
+  score                   composite score, breakdown, history sparkline
+  cves [--relevant|--all|--kev]
+                          list vulnerabilities. Default: only those matching
+                          installed packages.
+  feeds                   show which threat feeds have recent data
+  report                  markdown report of current state
+  set-baseline            snapshot SUID inventory so the next run detects drift
+  notify-test             fire a sample desktop notification
+  config [--edit|--path]  show, edit, or print the path to config.toml
+  run                     run the collector now (also fires from a 5-min timer)
+  version                 print version
+  help                    this
+
+state lives at  $STATE
+config lives at $CONFIG_FILE
+EOF
+}
+
+###############################################################################
+# Dispatch
+###############################################################################
+
+cmd="${1:-status}"
+shift || true
+case "$cmd" in
+    status)        cmd_status "$@" ;;
+    health)        cmd_health "$@" ;;
+    score)         cmd_score "$@" ;;
+    cves)          cmd_cves "$@" ;;
+    feeds)         cmd_feeds "$@" ;;
+    report)        cmd_report "$@" ;;
+    set-baseline|baseline) cmd_set_baseline "$@" ;;
+    notify-test)   cmd_notify_test "$@" ;;
+    config)        cmd_config "$@" ;;
+    run|run-now)   cmd_run "$@" ;;
+    version|--version|-v) cmd_version ;;
+    help|--help|-h) cmd_help ;;
+    *)             echo "unknown command: $cmd" >&2; cmd_help >&2; exit 2 ;;
+esac

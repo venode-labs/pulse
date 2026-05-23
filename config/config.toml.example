@@ -1,0 +1,37 @@
+# Security Pulse configuration.
+# Plain key=value, one per line. Comments start with #.
+# Boolean values: true / false. Numbers as bare digits. Strings unquoted.
+
+# Feeds
+feed_kev = true
+feed_arch = true
+feed_nvd = true
+feed_ghsa = true
+feed_epss = true
+
+# Severity floor for relevance and notifications. One of: low, medium, high, critical.
+severity_threshold = high
+
+# Desktop notifications when a new relevant CVE lands.
+notify_enabled = true
+notify_cooldown_minutes = 60
+
+# Score history window in days. The plasmoid sparkline reads this.
+score_history_days = 30
+
+# How many CVEs to keep in the relevant-list output.
+relevant_cap = 50
+
+# Recency window for relevance, in days. KEV entries older than this
+# are still queryable via `security-pulse cves --kev`, but they do not
+# count toward the composite-score penalty or the desktop alert. A 2010
+# Linux kernel CVE is not actionable for a 2026 kernel; this filter is
+# what turns the firehose into something a human can react to.
+kev_max_age_days = 365
+nvd_max_age_days = 30
+
+# Optional Hugo Cloud briefing. Leave endpoint blank to disable.
+# When set, the collector POSTs a short prompt to Hugo and stores the
+# reply under briefing.json. No data leaves your box if endpoint is blank.
+llm_endpoint =
+llm_token =

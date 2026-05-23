@@ -1,0 +1,19 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "ctavityan@gmail.com",
+                "Name": "Kaspar Tavitian"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Local system security health, composite risk score, threat feeds (CISA KEV, Arch ALSA, NVD, GHSA, EPSS) and CVE correlation against installed packages.",
+        "Icon": "security-high",
+        "Id": "com.casper.securitypulse",
+        "Name": "Security Pulse",
+        "Version": "0.2.0",
+        "Website": ""
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

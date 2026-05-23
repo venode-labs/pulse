@@ -1,0 +1,10 @@
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+node_modules/
+
+# Don't ship a populated config; the example template covers it.
+config/config.toml
