@@ -13,7 +13,7 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run shellcheck on shell sources
         run: |
           sudo apt-get update -qq && sudo apt-get install -y shellcheck
@@ -25,7 +25,7 @@ jobs:
     name: hygiene
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Anti-fingerprint scan
         run: |
           # The same scan the venode repo runs. Keep in sync. Markers
