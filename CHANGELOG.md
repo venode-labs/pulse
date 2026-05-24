@@ -4,6 +4,10 @@ All notable changes to pulse. Format inspired by Keep a Changelog. Versioning is
 
 ## [Unreleased]
 
+### Added
+
+- `pulse-brief`, a fourth binary. Reads the latest `score.json`, `health.json` and `relevant.json`, sends a compacted view to a local Ollama model, prints a four-paragraph plain-English summary. Defaults to `qwen2.5:3b`; override with `--model` or `PULSE_BRIEF_MODEL`. No cloud round-trip, no API key. The prompt is frozen in the script so brief shape stays stable across upgrades. Surfaces Ollama errors verbatim instead of failing silently. Installer + CI shellcheck updated.
+
 ### Planned for v0.4
 
 - `pulse allow add <process>` to edit the listening allowlist from the CLI.
@@ -12,6 +16,7 @@ All notable changes to pulse. Format inspired by Keep a Changelog. Versioning is
 - `--format sarif|json|table|csv` on `pulse cves`.
 - AppArmor / SELinux honest no-op when neither LSM is installed.
 - Rename config + state dirs to avoid the PulseAudio namespace.
+- Per-probe `remediation` field and a `pulse fix <finding>` subcommand that delegates package CVEs to `topgrade` and uses `pkexec` for privilege elevation.
 
 ## [0.3.0] - 2026-05-24
 

@@ -48,6 +48,7 @@ mkdir -p "$BIN_DIR" "$PLASMA_DIR" "$SYSTEMD_DIR" "$ENV_DIR" "$CONF_DIR"
 say "binaries -> $BIN_DIR"
 install -m 0755 "$REPO_ROOT/bin/pulse"           "$BIN_DIR/pulse"
 install -m 0755 "$REPO_ROOT/bin/pulse-collector" "$BIN_DIR/pulse-collector"
+install -m 0755 "$REPO_ROOT/bin/pulse-brief"     "$BIN_DIR/pulse-brief"
 
 say "plasmoid -> $PLASMA_DIR/com.casper.pulse"
 rm -rf -- "$PLASMA_DIR/com.casper.pulse"

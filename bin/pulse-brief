@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# pulse-brief. Plain-English daily summary of the local pulse state,
+# written by a local LLM via Ollama. No cloud, no key, no telemetry.
+#
+# Reads ~/.local/state/pulse/{score,health,relevant}.json, compacts
+# them into a short input the model can fit in its context, then asks
+# the model to produce a four-paragraph summary the operator can read
+# in 30 seconds and act on.
+#
+# Defaults to qwen2.5:3b (fast, runs on CPU acceptably). Override with
+# PULSE_BRIEF_MODEL=<name> or --model <name>. Requires the Ollama
+# daemon listening on http://localhost:11434 (the default).
+#
+# (c) Venode Labs. MIT.
+
+set -u
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/pulse"
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+MODEL="${PULSE_BRIEF_MODEL:-qwen2.5:3b}"
+TIMEOUT="${PULSE_BRIEF_TIMEOUT:-120}"
+
+usage() {
+    cat <<'EOF'
+pulse-brief, plain-English summary of the latest pulse state.
+
+Usage: pulse-brief [--model NAME]
+
+Options:
+  --model NAME      Ollama model to use (default: qwen2.5:3b).
+  -h, --help        Show this message.
+
+Environment:
+  PULSE_BRIEF_MODEL     overrides --model.
+  PULSE_BRIEF_TIMEOUT   curl --max-time, seconds (default 120).
+  OLLAMA_URL            base URL of the Ollama daemon (default http://localhost:11434).
+
+Reads ~/.local/state/pulse/{score,health,relevant}.json. Run 'pulse run'
+first if no state exists yet.
+
+Prints the brief in one block when the model has finished generating.
+Typical cold-start latency on a CPU-only machine is 20 to 60 seconds.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model)      MODEL="$2"; shift 2 ;;
+        -h|--help)    usage; exit 0 ;;
+        *) echo "pulse-brief: unknown argument: $1" >&2; usage >&2; exit 64 ;;
+    esac
+done
+
+# Hard deps
+for tool in jq curl; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "pulse-brief: $tool is required (pacman -S $tool)" >&2
+        exit 1
+    fi
+done
+
+# State presence
+for f in score.json health.json relevant.json; do
+    if [[ ! -s "$STATE/$f" ]]; then
+        echo "pulse-brief: missing $STATE/$f. Run 'pulse run' first." >&2
+        exit 4
+    fi
+done
+
+# Ollama reachability
+if ! curl -sf -m 3 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
+    cat <<EOF >&2
+pulse-brief: Ollama not reachable at $OLLAMA_URL.
+
+Install:
+  pacman -S ollama
+
+Start:
+  systemctl --user enable --now ollama   # if the user unit is set up
+  # or
+  ollama serve >/dev/null 2>&1 &
+
+Pull a small model:
+  ollama pull qwen2.5:3b
+EOF
+    exit 3
+fi
+
+# Confirm the model is pulled. A missing model causes a slow first-time
+# pull from the API; better to fail fast and tell the operator.
+if ! curl -sf "$OLLAMA_URL/api/tags" | jq -e --arg m "$MODEL" '.models[] | select(.name == $m or .model == $m)' >/dev/null; then
+    echo "pulse-brief: model '$MODEL' not pulled. Run 'ollama pull $MODEL' first." >&2
+    exit 3
+fi
+
+# Build the compact input the model sees. Trim the long CVE descriptions
+# so the prompt stays under a couple of thousand tokens.
+INPUT=$(
+    jq -n \
+        --slurpfile score "$STATE/score.json" \
+        --slurpfile health "$STATE/health.json" \
+        --slurpfile relevant "$STATE/relevant.json" \
+        '{
+            score:   ($score[0]   | {score, health_score, relevant, history: (.history // [] | .[-3:])}),
+            posture: ($health[0]  | {overall, score, host, updated, items: (.items // {} | to_entries | map({check: .key, severity: .value.severity, status: .value.status, message: (.value.message // "")}))}),
+            threats: ($relevant[0] | {count, severity_floor, updated, top: (.items // [] | sort_by(.severity == "CRITICAL", .severity == "HIGH") | reverse | .[0:6] | map({id, package, severity, title: (.title | .[0:240])}))})
+        }'
+)
+
+# System prompt frozen here so the brief shape stays stable across
+# upgrades. Output rules match the rest of the venode product voice:
+# AU English, no em dashes, no markdown headers, no bullet lists.
+SYSTEM=$(cat <<'PROMPT'
+You are pulse-brief, a security analyst summarising one Linux host's daily security telemetry for a non-technical reader.
+
+Output exactly four paragraphs. No headers. No bullet lists. No markdown. Plain prose.
+
+Paragraph 1, one or two sentences: today's score and overall posture, plus the single most important change since the previous run if one is visible in the history.
+
+Paragraph 2, two or three sentences: the top one or two CVEs affecting installed packages by severity. Name the package, name the CVE id, one-sentence impact. If the threats list is empty, say so plainly.
+
+Paragraph 3, one or two sentences: any posture regressions (a probe showing warn or critical). If none, state that explicitly.
+
+Paragraph 4, one or two sentences: the single concrete next step the reader should take today. Be specific (a package to update, a service to enable, a configuration line to change). If the system is in good shape, say so and recommend a sensible periodic check.
+
+Rules:
+- Australian English spelling: colour, behaviour, realise, organise, analyse, centre.
+- No em dashes or en dashes as sentence punctuation. Use commas, colons, or full stops.
+- Never speculate beyond the supplied JSON.
+- Never invent CVE IDs, package names, or shell commands. Use only what appears in the input.
+- If a field is empty or zero, say so plainly.
+- Total length: no more than 220 words.
+PROMPT
+)
+
+# Compose the JSON payload. Non-streaming on purpose: simpler error
+# handling, no partial-output edge cases. Operators who want token-by-
+# token output can call the Ollama API themselves.
+PAYLOAD=$(jq -n \
+    --arg model "$MODEL" \
+    --arg system "$SYSTEM" \
+    --arg user "$INPUT" \
+    '{
+        model: $model,
+        stream: false,
+        messages: [
+            {role: "system", content: $system},
+            {role: "user",   content: $user}
+        ],
+        options: { temperature: 0.2, num_ctx: 8192 }
+    }')
+
+# Errors are returned with an HTTP 4xx/5xx and JSON body `{"error": "..."}`.
+# Capture status and body separately so the operator sees the actual cause,
+# not a silent exit.
+TMP_BODY=$(mktemp)
+trap 'rm -f "$TMP_BODY"' EXIT
+
+STATUS=$(curl -s -m "$TIMEOUT" -o "$TMP_BODY" -w '%{http_code}' \
+    -H 'Content-Type: application/json' \
+    --data-binary "$PAYLOAD" \
+    "$OLLAMA_URL/api/chat")
+
+if [[ "$STATUS" != '200' ]]; then
+    err=$(jq -r '.error // "no error field"' "$TMP_BODY" 2>/dev/null || cat "$TMP_BODY")
+    echo "pulse-brief: ollama returned HTTP $STATUS: $err" >&2
+    exit 5
+fi
+
+jq -r '.message.content' "$TMP_BODY"
