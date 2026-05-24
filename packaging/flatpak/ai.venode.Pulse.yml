@@ -1,0 +1,32 @@
+# Flatpak manifest for Pulse. Note: Flatpak is a poor fit for a host-
+# security scanner (sandbox isolation hides /proc, pacman db, journal
+# from the app), so the manifest is here for completeness only. Users
+# on Arch and Fedora should prefer the native package.
+
+app-id: ai.venode.Pulse
+runtime: org.kde.Platform
+runtime-version: '6.7'
+sdk: org.kde.Sdk
+command: pulse
+
+finish-args:
+  - --filesystem=host:ro
+  - --filesystem=xdg-config/pulse:create
+  - --filesystem=xdg-state/pulse:create
+  - --share=network
+  - --talk-name=org.freedesktop.systemd1
+  # The bundled bash relies on the host's pacman, ss, systemctl. The
+  # sandbox passes these through with --filesystem=host:ro; expect a
+  # subset of probes to no-op compared to a native install.
+
+modules:
+  - name: pulse
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 bin/pulse           /app/bin/pulse
+      - install -Dm755 bin/pulse-collector /app/bin/pulse-collector
+      - install -Dm644 config/config.toml.example  /app/share/pulse/config.toml
+      - install -Dm644 LICENSE                     /app/share/licenses/pulse/LICENSE
+    sources:
+      - type: dir
+        path: ../..

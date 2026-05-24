@@ -1,0 +1,30 @@
+Source: pulse
+Section: admin
+Priority: optional
+Maintainer: Venode Labs <labs@venode.ai>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/keletonik/pulse
+Vcs-Browser: https://github.com/keletonik/pulse
+Vcs-Git: https://github.com/keletonik/pulse.git
+Rules-Requires-Root: no
+
+Package: pulse-sec
+Architecture: all
+Depends: ${misc:Depends}, bash, jq, curl, iproute2, systemd
+Recommends: kdialog
+Description: Host security pulse-check, CLI + collector
+ Composite risk score from fourteen local host probes (firewall, kernel
+ age, listening ports, LUKS, SSH, secure boot, suid drift and others)
+ cross-referenced against CVE feeds.
+ .
+ Provides the pulse CLI and pulse-collector daemon. Pulse is Arch-first;
+ on Debian and Ubuntu the package-inventory probe is a no-op until a
+ dpkg backend lands in v1.x.
+
+Package: pulse-plasmoid
+Architecture: all
+Depends: ${misc:Depends}, pulse-sec, plasma-workspace
+Description: KDE Plasma 6 widget for pulse
+ Renders the composite score, probe rows and CVE list in the panel.
+ Reads JSON state written by pulse-collector.
