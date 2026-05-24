@@ -50,8 +50,8 @@ score you can put on your panel.
 ## Install
 
 ```sh
-git clone https://github.com/venode-labs/security-pulse.git
-cd security-pulse
+git clone https://github.com/venode-labs/pulse.git
+cd pulse
 ./install.sh
 ```
 
