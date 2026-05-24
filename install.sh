@@ -1,65 +1,80 @@
 #!/usr/bin/env bash
-# Security Pulse installer.
-# No root needed. Lays the collector, CLI, widget, systemd timer and
-# config into the standard XDG locations, then arms the timer.
+# Pulse installer.
 #
-# Author: Kaspar Tavitian
+# Idempotent. Installs into XDG locations under $HOME, no root needed
+# at any step. Symlink-friendly: re-running this from the same checkout
+# updates every binary, unit, config example and the plasmoid in place.
+#
+# Locations:
+#   ~/.local/bin/pulse                          CLI
+#   ~/.local/bin/pulse-collector                background collector
+#   ~/.local/share/plasma/plasmoids/com.casper.pulse/   widget
+#   ~/.config/systemd/user/pulse.{service,timer}
+#   ~/.config/pulse/config.toml                 (created from example on first run)
+#   ~/.config/environment.d/pulse.conf
+#
+# After install: systemctl --user daemon-reload, enable+start the timer.
 
-set -eu
+set -euo pipefail
 
-SRC=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-BIN="$HOME/.local/bin"
-SHARE_PLASMOID="$HOME/.local/share/plasma/plasmoids/com.casper.securitypulse"
-SYSTEMD_USER="$HOME/.config/systemd/user"
-ENV_D="$HOME/.config/environment.d"
-CONFIG_DIR="$HOME/.config/security-pulse"
-STATE_DIR="$HOME/.local/state/security-pulse"
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+BIN_DIR="$HOME/.local/bin"
+PLASMA_DIR="$HOME/.local/share/plasma/plasmoids"
+SYSTEMD_DIR="$HOME/.config/systemd/user"
+ENV_DIR="$HOME/.config/environment.d"
+CONF_DIR="$HOME/.config/pulse"
 
-mkdir -p "$BIN" "$SHARE_PLASMOID" "$SYSTEMD_USER" "$ENV_D" "$CONFIG_DIR" "$STATE_DIR" \
-         "$CONFIG_DIR/baselines"
+say() { printf '[pulse-install] %s\n' "$*"; }
 
-echo "installing CLI + collector to $BIN"
-install -m 755 "$SRC/bin/security-pulse"           "$BIN/security-pulse"
-install -m 755 "$SRC/bin/security-pulse-collector" "$BIN/security-pulse-collector"
-
-echo "installing plasmoid to $SHARE_PLASMOID"
-mkdir -p "$SHARE_PLASMOID/contents/ui"
-install -m 644 "$SRC/plasmoid/metadata.json"            "$SHARE_PLASMOID/metadata.json"
-install -m 644 "$SRC/plasmoid/contents/ui/main.qml"     "$SHARE_PLASMOID/contents/ui/main.qml"
-install -m 644 "$SRC/plasmoid/contents/ui/FullView.qml" "$SHARE_PLASMOID/contents/ui/FullView.qml"
-
-echo "installing systemd units to $SYSTEMD_USER"
-install -m 644 "$SRC/systemd/security-pulse.service" "$SYSTEMD_USER/security-pulse.service"
-install -m 644 "$SRC/systemd/security-pulse.timer"   "$SYSTEMD_USER/security-pulse.timer"
-
-echo "installing environment override to $ENV_D"
-install -m 644 "$SRC/config/environment.d/security-pulse.conf" "$ENV_D/security-pulse.conf"
-
-if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
-    echo "seeding $CONFIG_DIR/config.toml from example"
-    install -m 644 "$SRC/config/config.toml.example" "$CONFIG_DIR/config.toml"
-else
-    echo "leaving existing $CONFIG_DIR/config.toml in place"
+# Refuse on non-Arch hosts. The collector reads /var/log/pacman.log and
+# uses pacman -Qi for installed-package inventory; nothing else works.
+if [[ ! -r /etc/arch-release && ! -r /etc/os-release ]] \
+   || ! grep -qiE 'arch' /etc/os-release 2>/dev/null; then
+    say 'Pulse targets Arch Linux. /etc/os-release does not look like Arch; refusing.'
+    say 'Pass PULSE_FORCE=1 to install anyway.'
+    [[ "${PULSE_FORCE:-0}" == "1" ]] || exit 1
 fi
 
-echo "reloading systemd user manager"
+# Required runtime deps.
+for tool in jq curl pacman ss; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        say "missing dependency: $tool"
+        exit 1
+    fi
+done
+
+mkdir -p "$BIN_DIR" "$PLASMA_DIR" "$SYSTEMD_DIR" "$ENV_DIR" "$CONF_DIR"
+
+say "binaries -> $BIN_DIR"
+install -m 0755 "$REPO_ROOT/bin/pulse"           "$BIN_DIR/pulse"
+install -m 0755 "$REPO_ROOT/bin/pulse-collector" "$BIN_DIR/pulse-collector"
+
+say "plasmoid -> $PLASMA_DIR/com.casper.pulse"
+rm -rf -- "$PLASMA_DIR/com.casper.pulse"
+cp -r "$REPO_ROOT/plasmoid/com.casper.pulse" "$PLASMA_DIR/"
+
+say "systemd units -> $SYSTEMD_DIR"
+install -m 0644 "$REPO_ROOT/systemd/pulse.service" "$SYSTEMD_DIR/pulse.service"
+install -m 0644 "$REPO_ROOT/systemd/pulse.timer"   "$SYSTEMD_DIR/pulse.timer"
+
+say "environment.d hook -> $ENV_DIR"
+install -m 0644 "$REPO_ROOT/config/pulse.conf" "$ENV_DIR/pulse.conf"
+
+if [[ ! -f "$CONF_DIR/config.toml" ]]; then
+    say "seeding $CONF_DIR/config.toml (no existing file)"
+    install -m 0644 "$REPO_ROOT/config/config.toml.example" "$CONF_DIR/config.toml"
+else
+    say "$CONF_DIR/config.toml already present, not overwriting"
+fi
+
+say 'reloading user systemd'
 systemctl --user daemon-reload
 
-echo "arming the timer (every 5 min, 1 min after boot)"
-systemctl --user enable --now security-pulse.timer
+say 'enabling and starting pulse.timer'
+systemctl --user enable --now pulse.timer
 
-echo "running the collector once"
-"$BIN/security-pulse-collector" || true
+say 'refreshing the KDE service cache'
+kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
 
-cat <<EOF
-
-Done.
-
-Quick checks:
-  security-pulse status
-  systemctl --user status security-pulse.timer
-
-Widget: right-click a Plasma panel or desktop, Add Widgets, search
-"Security Pulse". If it does not appear, refresh Plasma's QML cache:
-  kquitapp6 plasmashell && kstart plasmashell
-EOF
+say 'done. Add the Pulse widget from the panel widget picker.'
+say 'First collection runs within one minute; rerun on demand with: systemctl --user start pulse.service'

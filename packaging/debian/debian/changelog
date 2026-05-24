@@ -1,0 +1,7 @@
+pulse (0.3.0-1) unstable; urgency=low
+
+  * Initial public release. Bash collector, fourteen host probes, CVE
+    correlation across Arch ALSA, CISA KEV, NVD, EPSS. KDE Plasma 6
+    widget. Composite risk score.
+
+ -- Venode Labs <labs@venode.ai>  Sun, 24 May 2026 19:30:00 +1000

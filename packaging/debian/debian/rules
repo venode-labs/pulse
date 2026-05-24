@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+# Debian build rules, dh-style.
+
+%:
+	dh $@
+
+override_dh_auto_install:
+	# pulse CLI + collector
+	install -Dm755 bin/pulse           debian/pulse-sec/usr/bin/pulse
+	install -Dm755 bin/pulse-collector debian/pulse-sec/usr/bin/pulse-collector
+	# systemd user units
+	install -Dm644 systemd/pulse.service debian/pulse-sec/lib/systemd/user/pulse.service
+	install -Dm644 systemd/pulse.timer   debian/pulse-sec/lib/systemd/user/pulse.timer
+	# config + environment.d
+	install -Dm644 config/config.toml.example debian/pulse-sec/etc/pulse/config.toml
+	install -Dm644 config/pulse.conf          debian/pulse-sec/usr/lib/environment.d/90-pulse.conf
+	# plasmoid (separate binary package)
+	install -d debian/pulse-plasmoid/usr/share/plasma/plasmoids/com.casper.pulse
+	cp -r plasmoid/com.casper.pulse/. debian/pulse-plasmoid/usr/share/plasma/plasmoids/com.casper.pulse/
+
+override_dh_installsystemd:
+	# User units, not system. Skip the default machinery.

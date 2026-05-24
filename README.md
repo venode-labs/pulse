@@ -1,167 +1,123 @@
-# Security Pulse
+<p align="center">
+  <img src=".assets/venode-wordmark.svg" alt="Venode" height="64">
+</p>
 
-A lightweight, no-daemon, KDE-native pulse for a personal Linux workstation.
-Reads five public threat feeds, cross-references every CVE against the
-packages installed on the local box, and surfaces what is genuinely
-actionable: a composite risk score, a tabbed widget on your panel, a CLI,
-and a desktop notification when a new exploit lands against something you
-actually run.
+# pulse
 
-Built for Arch Linux + Plasma 6. Most of it (the CLI, the collector,
-the feeds layer) is distro-agnostic and runs anywhere bash, jq and curl do.
+A host-security pulse-check for Arch Linux. One number, one screen, no theatre.
 
-## What you get
+Fourteen probes against the live box (firewall, kernel age, listening ports, LUKS, SSH, secure boot, suid drift, ...) plus a CVE matcher across four public feeds (Arch ALSA, CISA KEV, NVD, EPSS), reconciled against actually-installed package versions. Surfaced through a CLI and a KDE Plasma 6 widget.
 
-- **Five feeds**: CISA KEV (known exploited), Arch ALSA, NVD recent,
-  GitHub Security Advisories, FIRST EPSS exploit-probability.
-- **Fourteen local probes** without root: firewall, AppArmor, USBGuard,
-  pending updates, Secure Boot, TPM, LUKS, failed-login counter,
-  external listeners, VPN tunnel, kernel age, SUID inventory with
-  baseline diff, sshd hardening, days since last `pacman -Syu`.
-- **Installed-package correlation**. Every published CVE is matched
-  against `pacman -Q` via tokenised vendor/product equality (KEV) and
-  structured CPE extraction (NVD), with a recency window so 2010 noise
-  doesn't drown the signal.
-- **Composite risk score** (0-100), persisted with a rolling
-  history window. The plasmoid renders the trend as a sparkline.
-- **Tabbed Plasma 6 widget**: Overview (score gauge + top relevant CVEs),
-  Threats (combo across all four feeds), Local (every probe in priority
-  order), History (score trend).
-- **Real CLI**: `security-pulse status`, `cves --relevant`, `score`,
-  `report`, `set-baseline`, `notify-test`, `config --edit`.
-- **Desktop notifications** with cooldown when a new high-or-critical
-  relevant CVE lands.
-- **No daemon**. One systemd user timer, one short-lived collector run
-  every five minutes. Nothing listens.
+The product question this answers: *what is the security state of this machine, right now, in one number, plus the short list of things to look at?*
 
-## Why not something else
-
-- `arch-audit` is CLI only and ALSA only. Security Pulse is a superset.
-- OpenCVE is a server-side platform. Heavyweight for a single workstation.
-- Wazuh is an agent-based SIEM with a backend. Overkill for one box.
-- osquery is SQL telemetry with no dashboard, no feed integration.
-- Falco is eBPF runtime detection aimed at containers.
-- OpenVAS is a network vulnerability scanner.
-
-Security Pulse sits in the personal-workstation gap: native KDE,
-no daemon, no agent, live threat-feed-to-package correlation, with a
-score you can put on your panel.
+```
+$ pulse
+score    47 / 100         warn
+probes   10 ok · 3 warn · 1 info
+cves     0 critical · 8 high · 0 medium
+top      libxml2: AVG-2898 (Vulnerable)
+         pam:     AVG-2901 (Vulnerable)
+         djvulibre: AVG-2907 (Vulnerable)
+```
 
 ## Install
 
-```sh
-git clone https://github.com/venode-labs/pulse.git
-cd pulse
-./install.sh
+Arch (recommended):
+
+```
+yay -S pulse-bin
 ```
 
-The installer copies the collector and CLI to `~/.local/bin`, the
-widget to `~/.local/share/plasma/plasmoids/`, the systemd units to
-`~/.config/systemd/user/`, the QML XHR environment override to
-`~/.config/environment.d/`, and seeds `~/.config/security-pulse/config.toml`
-from the bundled example if you do not already have one.
+Anything else, the script-install path:
 
-It then enables the user-level timer and runs the collector once.
-
-## Add the widget
-
-Once installed and the collector has run at least once:
-
-1. Right-click an empty bit of your KDE panel or desktop.
-2. Pick **Add Widgets...**
-3. Search for **Security Pulse**.
-4. Drag onto the panel or desktop.
-
-The compact representation shows a coloured dot and the composite
-score. Click for the full popup.
-
-If the widget does not appear in the search, refresh the Plasma cache:
-
-```sh
-kquitapp6 plasmashell && kstart plasmashell
+```
+git clone https://github.com/keletonik/pulse
+cd pulse && ./install.sh
 ```
 
-## Use the CLI
+Per-distro packages: `packaging/` carries the PKGBUILD, the debian/ tree, the .spec, the AppImage recipe and the Flatpak manifest. Pick the one for your distro.
 
-```sh
-security-pulse status         # one-line score plus the local rundown
-security-pulse cves --relevant
-security-pulse cves --kev     # full KEV recent list (no installed-package filter)
-security-pulse score          # composite, breakdown, history sparkline
-security-pulse report         # markdown report of current state
-security-pulse set-baseline   # snapshot SUID inventory so the next run detects drift
-security-pulse notify-test    # confirm desktop notifications are wired
-security-pulse config --edit  # open config in $EDITOR
-security-pulse run            # run the collector now
-security-pulse help
+XDG-clean install. No root, no daemon, no network listener of its own. Files land under `~/.local/bin`, `~/.local/share/plasma`, `~/.config/pulse`, `~/.local/state/pulse`, `~/.config/systemd/user`.
+
+## What it actually checks
+
+```
+firewall          systemctl is-active against nftables / iptables / firewalld / ufw
+apparmor          apparmor.service state, plus apparmor_status presence
+usbguard          usbguard.service state
+updates           checkupdates count; flags kernel-pending separately
+secureboot        bootctl status
+tpm               /dev/tpm0, /dev/tpmrm0
+luks              lsblk -o FSTYPE looking for crypto_LUKS
+failed_logins     journal scan, 24h window
+listening_ports   ss -tunlp, port -> service fallback, allowlist driven
+vpn               proton*, wg*, tun*, tailscale* interface presence
+kernel            running kernel + days since pacman installed the matching package
+suid              suid/sgid binary inventory, delta against a saved baseline
+ssh               sshd -T first, then sshd_config + drop-ins, then documented defaults
+last_upgrade      days since the most recent `starting full system upgrade` in pacman.log
 ```
 
-## Configuration
+Every probe reports *what it saw* alongside its severity. No black-box `Critical` labels.
 
-Lives at `~/.config/security-pulse/config.toml`. See
-`config/config.toml.example` for the full schema with comments. The
-shape is plain `key = value`, one per line, no nested tables.
+## CVE matcher
 
-Notable knobs:
+Two ground rules, both learned the hard way during v0.x:
 
-- `severity_threshold` (low | medium | high | critical). Floor for
-  relevance and notifications. Default `high`.
-- `notify_cooldown_minutes`. Minimum gap between desktop notifications.
-  Default `60`.
-- `kev_max_age_days` / `nvd_max_age_days`. How far back to look in
-  each feed for relevance. The full feeds are still queryable with
-  `security-pulse cves --kev` and `--all`.
-- `score_history_days`. Rolling window for the score sparkline.
-- `llm_endpoint` / `llm_token`. Optional. If set, the collector POSTs
-  a compact snapshot to your own LLM endpoint and stores a one-line
-  briefing under `briefing.json`. Default is blank, so no data leaves
-  your box.
+1. The package name must match an actually-installed package. Name-match alone gave 50 phantom criticals on a clean Arch box.
+2. The advisory must be live. An ALSA entry marked `Fixed` does not count. A KEV or NVD entry whose CVE is in Arch's `Fixed` set does not count either.
 
-## Where everything lives
+What's still imperfect in v0.3: NVD CPE 2.3 version-range parsing. A CVE flagged by NVD against `bind 9.20.0 to 9.20.22` will surface when you have 9.20.23 installed. The Go rewrite in `docs/ROADMAP.md` fixes that.
 
-| What | Path |
-|---|---|
-| Collector script | `~/.local/bin/security-pulse-collector` |
-| CLI | `~/.local/bin/security-pulse` |
-| Widget code | `~/.local/share/plasma/plasmoids/com.casper.securitypulse/` |
-| Config | `~/.config/security-pulse/config.toml` |
-| SUID baseline | `~/.config/security-pulse/baselines/suid.txt` |
-| Systemd timer + service | `~/.config/systemd/user/security-pulse.{timer,service}` |
-| Environment override | `~/.config/environment.d/security-pulse.conf` |
-| State (JSON the widget reads) | `~/.local/state/security-pulse/` |
+## Composite score
 
-## Requirements
+```
+health  = sum(probe_score) * 100 / (n_probes * 10),  ok=10 info=8 warn=5 critical=0
+penalty = clamp(0, critical*8 + high*4 + medium*1, 60)
+score   = clamp(0, health - penalty, 100)
+```
 
-Hard:
+The weights are deliberate but not from CVSS or SSVC. They are documented so an operator can disagree with them. Patch them in `bin/pulse-collector` if your threat model wants different.
 
-- `bash`, `curl`, `jq` (commonly: `pacman -S jq`).
-- A systemd user manager (Plasma sessions run one by default).
-- KDE Plasma 6 if you want the widget.
+## Config
 
-Soft (each missing piece downgrades a probe to "unknown" instead of
-failing the run):
+`~/.config/pulse/config.toml`. Plain `key = value`. Highlights:
 
-- `pacman` for installed-package correlation and the Arch update probe.
-- `checkupdates` (`pacman-contrib`) for the pending-updates count.
-- `bootctl` for Secure Boot state.
-- `notify-send` (`libnotify`) for desktop alerts.
+```toml
+severity_threshold  = high
+notify_enabled      = true
+listening_allowlist = sshd, systemd-resolved, avahi-daemon, cups-browsed
+score_history_days  = 30
+```
 
-## Honesty floor
+`listening_allowlist` extends the set of services the listener probe considers expected. Look up an unknown port with `sudo ss -tunlp '( sport = :<port> )'` and add the owning process once you know what it is.
 
-What this is not:
+## Roadmap
 
-- A vulnerability scanner with version-aware CPE matching. The current
-  matcher is tokenised + recency-windowed; a 2027 release will swap to
-  full CPE version-range comparison.
-- A SIEM. It does not centralise logs, query at scale, or run agents
-  across hosts. One personal machine, one timer.
-- A replacement for `lynis`, `arch-audit`, or `rkhunter`. It pulls
-  data from a different angle and they are complementary.
+This is the bash v0.3. It works end to end on current Arch. The Go rewrite is the next major and replaces:
+
+- NVD CPE version-range comparison done properly.
+- ALSA `vercmp` against the `fixed` field rather than the status alone.
+- A `pulse explain <cve>` subcommand showing the full provenance chain for one finding.
+- SARIF + CycloneDX JSON output (CI-friendly).
+- HTTP-served JSON the widget polls instead of file:// reads.
+
+Full plan in `docs/ROADMAP.md`.
+
+## Non-goals
+
+- Multi-host fleet view. This measures one machine. A fleet rollup belongs upstream.
+- Container scanning. Use `grype` or `trivy` for that surface.
+- Anything that scans beyond `localhost`.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. © 2026 Venode Labs.
 
-## Author
+## Acknowledgements
 
-Kaspar Tavitian.
+- [security.archlinux.org](https://security.archlinux.org/), ALSA tracker.
+- [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog).
+- [NVD](https://nvd.nist.gov/) and [FIRST EPSS](https://www.first.org/epss/).
+- [arch-audit](https://gitlab.archlinux.org/archlinux/arch-audit) for the ALSA matcher pattern.
+- [grype](https://github.com/anchore/grype) and [osv-scanner](https://github.com/google/osv-scanner) for the CLI shape this is moving towards.

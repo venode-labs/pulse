@@ -1,7 +1,7 @@
-// Security Pulse, popup view.
+// Pulse, popup view.
 // Tabs: Overview, Threats, Local, History.
 //
-// Author: Kaspar Tavitian
+// (c) Venode Labs
 
 import QtQuick
 import QtQuick.Layouts
@@ -129,7 +129,7 @@ Item {
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 0
-                Kirigami.Heading { level: 2; text: "Security Pulse" }
+                Kirigami.Heading { level: 2; text: "Pulse" }
                 QQC.Label {
                     text: healthData.host
                         ? (healthData.host + " · " + ((relevantData && relevantData.count) || 0) + " relevant CVE(s)")
@@ -433,26 +433,61 @@ Item {
                     ListView {
                         model: itemEntries()
                         spacing: 0
-                        delegate: RowLayout {
+                        delegate: ColumnLayout {
                             width: ListView.view.width
-                            spacing: Kirigami.Units.smallSpacing
+                            spacing: 0
 
-                            Rectangle {
-                                width: Kirigami.Units.smallSpacing
-                                Layout.fillHeight: true
-                                color: severityColour(modelData.value.severity)
-                            }
-                            QQC.Label {
-                                text: prettyKey(modelData.key)
-                                Layout.preferredWidth: Kirigami.Units.gridUnit * 10
-                            }
-                            QQC.Label {
-                                text: detail(modelData.key, modelData.value)
-                                color: Kirigami.Theme.disabledTextColor
+                            // Hover-to-expand: the row shows just the
+                            // probe's `status` line; clicking the row
+                            // reveals the longer `message` underneath.
+                            property bool expanded: false
+
+                            RowLayout {
                                 Layout.fillWidth: true
-                                elide: Text.ElideRight
-                                wrapMode: Text.NoWrap
+                                spacing: Kirigami.Units.smallSpacing
+
+                                Rectangle {
+                                    width: Kirigami.Units.smallSpacing
+                                    Layout.fillHeight: true
+                                    color: severityColour(modelData.value.severity)
+                                }
+                                QQC.Label {
+                                    text: prettyKey(modelData.key)
+                                    Layout.preferredWidth: Kirigami.Units.gridUnit * 10
+                                }
+                                QQC.Label {
+                                    text: modelData.value.status
+                                        || detail(modelData.key, modelData.value)
+                                    color: Kirigami.Theme.disabledTextColor
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                    wrapMode: Text.NoWrap
+                                }
+                                QQC.ToolButton {
+                                    visible: !!modelData.value.message
+                                    text: parent.parent.expanded ? "−" : "+"
+                                    flat: true
+                                    onClicked: parent.parent.expanded = !parent.parent.expanded
+                                }
                             }
+                            QQC.Label {
+                                visible: parent.expanded && !!modelData.value.message
+                                text: modelData.value.message || ""
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                                Layout.leftMargin: Kirigami.Units.gridUnit + Kirigami.Units.smallSpacing
+                                Layout.bottomMargin: Kirigami.Units.smallSpacing
+                                color: Kirigami.Theme.textColor
+                                font.pixelSize: Kirigami.Units.gridUnit * 0.85
+                            }
+                            // Hover anywhere on the row shows the same
+                            // text as the expand-on-click would, so the
+                            // operator does not need to commit a click.
+                            QQC.ToolTip.visible: hover.containsMouse && !!modelData.value.message
+                            QQC.ToolTip.text: modelData.value.message || ""
+                            QQC.ToolTip.delay: 400
+
+                            HoverHandler { id: hover }
                         }
                     }
                 }

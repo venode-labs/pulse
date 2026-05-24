@@ -1,10 +1,23 @@
+# Editor + OS
+.vscode/
+.idea/
 *.swp
 *.swo
-*~
 .DS_Store
-.idea/
-.vscode/
-node_modules/
 
-# Don't ship a populated config; the example template covers it.
+# Build / package output (reserved for the Go rewrite)
+/build/
+/dist/
+/pulse
+/pulse-collector
+*.tar.gz
+*.tar.zst
+*.pkg.tar.zst
+
+# Live state (operators should never check this in)
+state/
+*.log
+
+# Local config overrides
 config/config.toml
+!config/config.toml.example

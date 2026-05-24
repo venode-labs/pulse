@@ -3,7 +3,7 @@ Description=Security Pulse collector (system + threat feed snapshot)
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/security-pulse-collector
+ExecStart=%h/.local/bin/pulse-collector
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

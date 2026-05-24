@@ -1,0 +1,35 @@
+# Maintainer: Venode Labs <labs@venode.ai>
+
+pkgname=pulse
+pkgver=0.3.0
+pkgrel=1
+pkgdesc='Local security pulse-check for Arch Linux: composite risk score from host probes plus CVE correlation against ALSA, KEV, NVD, EPSS'
+arch=('any')
+url='https://github.com/keletonik/pulse'
+license=('MIT')
+depends=('bash' 'jq' 'curl' 'pacman' 'iproute2' 'systemd')
+optdepends=(
+    'kdialog: desktop notifications'
+    'pacman-contrib: checkupdates for the updates probe'
+    'apparmor: hardening, picked up by the apparmor probe'
+    'usbguard: hardening, picked up by the usbguard probe'
+)
+backup=("etc/${pkgname}/config.toml")
+source=("$pkgname-$pkgver.tar.gz::https://github.com/keletonik/pulse/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+
+    install -Dm755 bin/pulse           "$pkgdir/usr/bin/pulse"
+    install -Dm755 bin/pulse-collector "$pkgdir/usr/bin/pulse-collector"
+
+    install -Dm644 systemd/pulse.service "$pkgdir/usr/lib/systemd/user/pulse.service"
+    install -Dm644 systemd/pulse.timer   "$pkgdir/usr/lib/systemd/user/pulse.timer"
+
+    install -Dm644 config/config.toml.example "$pkgdir/etc/${pkgname}/config.toml"
+    install -Dm644 config/pulse.conf          "$pkgdir/usr/lib/environment.d/90-pulse.conf"
+
+    install -Dm644 LICENSE   "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

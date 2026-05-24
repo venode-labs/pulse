@@ -1,19 +1,14 @@
 #!/usr/bin/env bash
-# Security Pulse collector.
+# pulse-collector. Probes the host, pulls four threat feeds, matches
+# CVEs against installed packages, writes the JSON state. Five-minute
+# systemd user timer. No root, no privileged ops.
 #
-# Probes user-visible security signals on this Arch + KDE box, pulls
-# four public threat feeds, cross-references CVEs against the local
-# package inventory, computes a composite risk score, and writes the
-# JSON the plasmoid and CLI read.
-#
-# Runs on a 5-minute systemd user timer. Nothing here needs root.
-#
-# Author: Kaspar Tavitian
+# (c) Venode Labs. MIT.
 
 set -u
 
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/security-pulse"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/security-pulse"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/pulse"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pulse"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
 BASELINE_DIR="$CONFIG_DIR/baselines"
 mkdir -p "$STATE" "$BASELINE_DIR"
@@ -121,7 +116,30 @@ sev_rank() {
 
 ###############################################################################
 # Health probes
+#
+# Every probe returns a JSON object with three required keys plus
+# free-form facts:
+#
+#   severity:  one of ok | info | warn | critical (drives the score)
+#   status:    a short literal observation ('nftables active', '3 unexpected
+#              listeners', etc) — what the probe SAW
+#   message:   a human-friendly sentence carrying the evidence that
+#              earned the severity. Surfaced under each probe in the
+#              widget Local tab so the score is never opaque.
+#
+# emit_probe is the only path that produces a probe payload, so the
+# contract is enforced in one place.
 ###############################################################################
+
+emit_probe() {
+    local severity=$1 status=$2 message=$3 extra=${4:-'{}'}
+    jq -n \
+        --arg severity "$severity" \
+        --arg status   "$status" \
+        --arg message  "$message" \
+        --argjson extra "$extra" \
+        '{severity:$severity, status:$status, message:$message} + $extra'
+}
 
 probe_firewall() {
     local engine='none' active=0
@@ -132,41 +150,77 @@ probe_firewall() {
             break
         fi
     done
-    local severity='ok'
-    (( active == 0 )) && severity='critical'
-    printf '{"engine":"%s","active":%s,"severity":"%s"}' "$engine" "$active" "$severity"
+    if (( active == 1 )); then
+        emit_probe 'ok' "$engine active" \
+            "Firewall service $engine is running." \
+            "$(jq -n --arg engine "$engine" '{engine:$engine, active:true}')"
+    else
+        emit_probe 'critical' 'no firewall active' \
+            'No firewall service is running (checked nftables, iptables, ip6tables, firewalld, ufw).' \
+            '{"engine":"none","active":false}'
+    fi
 }
 
 probe_apparmor() {
-    local active=0
+    local active=0 installed=0
+    command -v apparmor_status >/dev/null 2>&1 && installed=1
     systemctl is-active --quiet apparmor.service && active=1
-    local sev='warn'
-    (( active == 1 )) && sev='ok'
-    printf '{"active":%s,"severity":"%s"}' "$active" "$sev"
+    if (( active == 1 )); then
+        emit_probe 'ok' 'apparmor active' 'AppArmor service is running.' '{"installed":true,"active":true}'
+    elif (( installed == 1 )); then
+        emit_probe 'warn' 'apparmor installed, not active' \
+            'AppArmor tools are present but apparmor.service is not running.' \
+            '{"installed":true,"active":false}'
+    else
+        emit_probe 'warn' 'apparmor not installed' \
+            'AppArmor is not installed on this system.' \
+            '{"installed":false,"active":false}'
+    fi
 }
 
 probe_usbguard() {
     local active=0 installed=0
     command -v usbguard >/dev/null 2>&1 && installed=1
     systemctl is-active --quiet usbguard.service && active=1
-    local sev='warn'
-    (( active == 1 )) && sev='ok'
-    (( installed == 0 )) && sev='info'
-    printf '{"installed":%s,"active":%s,"severity":"%s"}' "$installed" "$active" "$sev"
+    if (( active == 1 )); then
+        emit_probe 'ok' 'usbguard active' 'usbguard service is running and enforcing USB policy.' '{"installed":true,"active":true}'
+    elif (( installed == 1 )); then
+        emit_probe 'warn' 'usbguard installed, not active' \
+            'usbguard is installed but usbguard.service is not running; USB policy is not being enforced.' \
+            '{"installed":true,"active":false}'
+    else
+        emit_probe 'info' 'usbguard not installed' \
+            'usbguard is not installed; USB device policy is not enforced. Optional on workstations.' \
+            '{"installed":false,"active":false}'
+    fi
 }
 
 probe_updates() {
-    local total=0 kernel_pending=0
+    local total=0 kernel_pending=0 sample=''
     if command -v checkupdates >/dev/null 2>&1; then
         local out
         out=$(checkupdates 2>/dev/null || true)
         total=$(printf '%s' "$out" | grep -c . || true)
         printf '%s' "$out" | grep -q '^linux ' && kernel_pending=1
+        # First 5 names for the message
+        sample=$(printf '%s' "$out" | awk '{print $1}' | head -5 | paste -sd, -)
     fi
-    local sev='ok'
-    (( total > 50 )) && sev='warn'
-    (( kernel_pending == 1 )) && sev='warn'
-    printf '{"total":%s,"kernel_pending":%s,"severity":"%s"}' "$total" "$kernel_pending" "$sev"
+    local sev='ok' status="$total updates pending" message=''
+    if (( total == 0 )); then
+        message='System is fully up to date against the Arch repositories.'
+    else
+        message="$total updates pending"
+        [[ -n "$sample" ]] && message="$message ($sample$( (( total > 5 )) && echo ', …' )"
+        message="$message)."
+        (( total > 50 )) && sev='warn'
+        if (( kernel_pending == 1 )); then
+            sev='warn'
+            message="$message Kernel update is in the pending set; reboot needed after upgrade."
+        fi
+    fi
+    emit_probe "$sev" "$status" "$message" \
+        "$(jq -n --argjson t "$total" --argjson k "$kernel_pending" --arg sample "$sample" \
+            '{total:$t, kernel_pending:($k == 1), sample:$sample}')"
 }
 
 probe_secureboot() {
@@ -178,72 +232,236 @@ probe_secureboot() {
             sb='disabled'
         fi
     fi
-    local sev='warn'
-    [[ $sb == 'enabled' ]] && sev='ok'
-    [[ $sb == 'unknown' ]] && sev='info'
-    printf '{"state":"%s","severity":"%s"}' "$sb" "$sev"
+    case "$sb" in
+        enabled)
+            emit_probe 'ok' 'secure boot enabled' \
+                'UEFI Secure Boot is enabled; bootloader and kernel signatures are verified at boot.' \
+                '{"state":"enabled"}' ;;
+        disabled)
+            emit_probe 'warn' 'secure boot disabled' \
+                'UEFI Secure Boot is supported by the firmware but currently disabled.' \
+                '{"state":"disabled"}' ;;
+        *)
+            emit_probe 'info' 'secure boot state unknown' \
+                'bootctl could not determine Secure Boot state (not booted via systemd-boot or no UEFI variables readable).' \
+                '{"state":"unknown"}' ;;
+    esac
 }
 
 probe_tpm() {
-    local present=0
-    [[ -c /dev/tpm0 ]] && present=1
-    local sev='info'
-    (( present == 1 )) && sev='ok'
-    printf '{"present":%s,"severity":"%s"}' "$present" "$sev"
+    local present=0 device=''
+    [[ -c /dev/tpm0 ]] && { present=1; device='/dev/tpm0'; }
+    [[ -c /dev/tpmrm0 ]] && device="${device:+$device, }/dev/tpmrm0"
+    if (( present == 1 )); then
+        emit_probe 'ok' 'TPM present' "TPM character device available at $device." \
+            "$(jq -n --arg device "$device" '{present:true, device:$device}')"
+    else
+        emit_probe 'info' 'no TPM device' \
+            'No /dev/tpm0 device node; TPM is either absent, disabled in firmware, or the tpm_tis module is not loaded.' \
+            '{"present":false}'
+    fi
 }
 
 probe_luks() {
-    local has=0
-    lsblk -o FSTYPE 2>/dev/null | grep -q crypto_LUKS && has=1
-    local sev='warn'
-    (( has == 1 )) && sev='ok'
-    printf '{"present":%s,"severity":"%s"}' "$has" "$sev"
+    local has=0 devices=''
+    if command -v lsblk >/dev/null 2>&1; then
+        devices=$(lsblk -no NAME,FSTYPE 2>/dev/null | awk '$2 == "crypto_LUKS" {print $1}' | paste -sd, -)
+        [[ -n "$devices" ]] && has=1
+    fi
+    if (( has == 1 )); then
+        emit_probe 'ok' 'LUKS volume present' \
+            "Encrypted LUKS volume(s) detected: $devices." \
+            "$(jq -n --arg dev "$devices" '{present:true, devices:$dev}')"
+    else
+        emit_probe 'warn' 'no LUKS volume found' \
+            'No crypto_LUKS volumes mounted. Disk encryption is not in use on any block device this host can see.' \
+            '{"present":false}'
+    fi
 }
 
 probe_failed_logins() {
-    local count=0
+    local count=0 sample=''
     count=$(journalctl --since='24 hours ago' --no-pager 2>/dev/null \
             | grep -cE 'authentication failure|Failed password|FAILED LOGIN' || true)
+    if (( count > 0 )); then
+        sample=$(journalctl --since='24 hours ago' --no-pager 2>/dev/null \
+                 | grep -E 'authentication failure|Failed password|FAILED LOGIN' \
+                 | tail -1 | sed -E 's/.*: //' | cut -c1-120)
+    fi
     local sev='ok'
     (( count > 5 ))  && sev='warn'
     (( count > 20 )) && sev='critical'
-    printf '{"count_24h":%s,"severity":"%s"}' "$count" "$sev"
+    local message
+    if (( count == 0 )); then
+        message='No failed authentication events in the last 24 hours.'
+    else
+        message="$count failed auth event(s) in the last 24 hours."
+        [[ -n "$sample" ]] && message="$message Last: $sample"
+    fi
+    emit_probe "$sev" "$count failed in 24h" "$message" \
+        "$(jq -n --argjson c "$count" --arg s "$sample" '{count_24h:$c, last_sample:$s}')"
 }
 
 probe_listening_ports() {
-    local extern=0
+    # Externally-bound listeners (0.0.0.0 or [::]). Each entry:
+    # {proto, port, process, addr}. ss without root can only see processes
+    # the user owns, so process is often '-'. We back-fill with a well-
+    # known-port map so 'sshd:22' is named even when ss returns '-'.
+    # De-duplicated by (proto, port, process) so the v4+v6 pair counts once.
+    local items='[]' raw=''
     if command -v ss >/dev/null 2>&1; then
-        extern=$(ss -H -tunlp 2>/dev/null | awk '{print $5}' \
-                 | grep -cE '^(0\.0\.0\.0|\[::\]):' || true)
+        raw=$(ss -H -tunlp 2>/dev/null | awk '
+            $5 ~ /^(0\.0\.0\.0|\[::\]):/ {
+                proto = $1
+                addr  = $5
+                n = split(addr, parts, ":")
+                port = parts[n]
+                proc = "-"
+                for (i = 6; i <= NF; i++) {
+                    if ($i ~ /^users:/) {
+                        if (match($i, /"[^"]+"/)) {
+                            proc = substr($i, RSTART+1, RLENGTH-2)
+                        }
+                        break
+                    }
+                }
+                print proto"\t"port"\t"proc"\t"addr
+            }')
     fi
-    local sev='ok'
-    (( extern > 0 )) && sev='warn'
-    (( extern > 3 )) && sev='critical'
-    printf '{"external_listeners":%s,"severity":"%s"}' "$extern" "$sev"
+    if [[ -n "$raw" ]]; then
+        items=$(printf '%s\n' "$raw" \
+            | LC_ALL=C sort -u \
+            | jq -nR '
+                # Well-known port -> probable service. Used when ss did
+                # not report a process name (ss without root can not see
+                # processes owned by other users like root or systemd-
+                # resolve). The mapping is conservative and lists the
+                # service that owns the port on a typical Arch + KDE box.
+                def port_service:
+                    {
+                      "22":   "sshd",
+                      "53":   "systemd-resolved",
+                      "67":   "dhcp",
+                      "68":   "dhcp",
+                      "80":   "http",
+                      "111":  "rpcbind",
+                      "123":  "ntp",
+                      "137":  "samba-nmbd",
+                      "138":  "samba-nmbd",
+                      "139":  "samba-smbd",
+                      "143":  "imap",
+                      "443":  "https",
+                      "445":  "samba-smbd",
+                      "465":  "smtps",
+                      "514":  "syslog",
+                      "546":  "dhcp6",
+                      "547":  "dhcp6",
+                      "631":  "cups",
+                      "636":  "ldaps",
+                      "873":  "rsync",
+                      "993":  "imaps",
+                      "995":  "pop3s",
+                      "3306": "mysql",
+                      "5353": "avahi-daemon",
+                      "5355": "systemd-resolved",
+                      "5432": "postgres",
+                      "6379": "redis",
+                      "8080": "http-alt",
+                      "8443": "https-alt",
+                      "11434":"ollama",
+                      "27017":"mongo"
+                    };
+                [inputs | split("\t") | {
+                    proto:    .[0],
+                    port:     (.[1] | tonumber? // .[1]),
+                    raw_proc: .[2],
+                    addr:     .[3]
+                }
+                | . + { process:
+                    (if .raw_proc != "-" and .raw_proc != "" then .raw_proc
+                     else (port_service[(.port | tostring)] // "unknown")
+                     end) }
+                | del(.raw_proc)
+                ]
+                | group_by(.proto + ":" + (.port|tostring) + ":" + .process)
+                | map(.[0])
+            ' 2>/dev/null || echo '[]')
+    fi
+
+    # Default allowlist: services expected to listen externally on a
+    # typical Arch + KDE workstation. Operator can override via the
+    # listening_allowlist key in config.toml.
+    local allow_json='["sshd","systemd-resolve","systemd-resolved","avahi-daemon","cups-browsed","cupsd","NetworkManager","dhcp","dhcp6","ntp"]'
+    if [[ -n "${CFG_listening_allowlist:-}" ]]; then
+        allow_json=$(printf '%s' "$CFG_listening_allowlist" \
+            | jq -R 'split(",") | map(. | sub("^\\s+"; "") | sub("\\s+$"; ""))' \
+            2>/dev/null || printf '%s' "$allow_json")
+    fi
+
+    local total=0 unexpected=0
+    total=$(printf '%s' "$items" | jq 'length')
+    local unexpected_items
+    unexpected_items=$(printf '%s' "$items" | jq --argjson allow "$allow_json" \
+        '[.[] | select(.process as $p | $allow | index($p) == null)]')
+    unexpected=$(printf '%s' "$unexpected_items" | jq 'length')
+
+    local sev='ok' status='' message=''
+    if (( total == 0 )); then
+        status='no externally-bound listeners'
+        message='Nothing is listening on a public interface.'
+    elif (( unexpected == 0 )); then
+        local listing
+        listing=$(printf '%s' "$items" | jq -r '[.[] | "\(.process):\(.port)/\(.proto)"] | join(", ")')
+        sev='info'
+        status="$total expected listener(s)"
+        message="Only well-known services exposed: $listing."
+    else
+        local unexpected_listing
+        unexpected_listing=$(printf '%s' "$unexpected_items" | jq -r '[.[] | "\(.process):\(.port)/\(.proto)"] | join(", ")')
+        sev='warn'
+        (( unexpected > 3 )) && sev='critical'
+        status="$total listener(s), $unexpected unexpected"
+        message="Unexpected externally-bound services: $unexpected_listing. Allowlist them in config.toml if intentional."
+    fi
+
+    emit_probe "$sev" "$status" "$message" \
+        "$(jq -n --argjson items "$items" \
+                 --argjson total "$total" \
+                 --argjson unexpected "$unexpected" \
+                 --argjson unexpected_items "$unexpected_items" \
+                 --argjson allow "$allow_json" \
+            '{external_listeners:$total, unexpected:$unexpected, items:$items, unexpected_items:$unexpected_items, allow:$allow}')"
 }
 
 probe_vpn() {
-    local active=0
-    if ip -o link show 2>/dev/null | grep -qE ': (proton[0-9]+|wg[0-9]+|tun[0-9]+|tailscale[0-9]+):'; then
-        active=1
+    local iface=''
+    if command -v ip >/dev/null 2>&1; then
+        iface=$(ip -o link show 2>/dev/null \
+            | awk -F': ' '{print $2}' \
+            | grep -E '^(proton[0-9]+|wg[0-9]+|tun[0-9]+|tailscale[0-9]+)$' | head -1)
     fi
-    local sev='info'
-    (( active == 1 )) && sev='ok'
-    printf '{"active":%s,"severity":"%s"}' "$active" "$sev"
+    if [[ -n "$iface" ]]; then
+        emit_probe 'ok' "$iface up" "VPN interface $iface is up." \
+            "$(jq -n --arg if "$iface" '{active:true, interface:$if}')"
+    else
+        emit_probe 'info' 'no VPN interface' \
+            'No VPN interface detected (looked for proton*, wg*, tun*, tailscale*).' \
+            '{"active":false,"interface":null}'
+    fi
 }
 
 # Kernel staleness: days since the running kernel was packaged. Reads
 # the install date from pacman, not the upstream release date.
 probe_kernel_age() {
-    local days=0 running pkg ver
+    local days=-1 running pkg='linux' ver='' install_date=''
     running=$(uname -r)
-    pkg="linux"
-    if pacman -Q linux-zen >/dev/null 2>&1; then pkg="linux-zen"; fi
-    if pacman -Q linux-lts >/dev/null 2>&1 && [[ $running == *-lts ]]; then pkg="linux-lts"; fi
+    if pacman -Q linux-zen >/dev/null 2>&1 && [[ $running == *-zen ]]; then pkg='linux-zen'; fi
+    if pacman -Q linux-lts >/dev/null 2>&1 && [[ $running == *-lts ]]; then pkg='linux-lts'; fi
+    if pacman -Q linux-hardened >/dev/null 2>&1 && [[ $running == *-hardened ]]; then pkg='linux-hardened'; fi
     ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}')
     if [[ -n "$ver" ]]; then
-        local install_date
-        install_date=$(pacman -Qi "$pkg" 2>/dev/null | awk -F: '/^Install Date/ {sub(/^[ \t]+/,"",$0); print substr($0, index($0,$2))}' | sed 's/^[ \t]*//')
+        install_date=$(pacman -Qi "$pkg" 2>/dev/null \
+            | awk -F': ' '/^Install Date/ {print $2}' | sed 's/^[ \t]*//')
         if [[ -n "$install_date" ]]; then
             local secs
             secs=$(date -d "$install_date" +%s 2>/dev/null || echo 0)
@@ -255,53 +473,153 @@ probe_kernel_age() {
     local sev='ok'
     (( days > 60 ))  && sev='warn'
     (( days > 120 )) && sev='critical'
-    printf '{"running":"%s","package":"%s","installed_version":"%s","days_since_install":%s,"severity":"%s"}' \
-        "$running" "$pkg" "${ver:-unknown}" "$days" "$sev"
+    local status="kernel $running, ${days} day(s) since install"
+    local message
+    if (( days < 0 )); then
+        message='Could not determine kernel install date (pacman query failed).'
+        sev='info'
+    elif (( days <= 14 )); then
+        message="Running kernel $running from package $pkg $ver, installed $days day(s) ago."
+    else
+        message="Running kernel $running ($pkg $ver) is $days day(s) old. Reboot to apply newer kernel if pacman -Syu has pulled one."
+    fi
+    emit_probe "$sev" "$status" "$message" \
+        "$(jq -n --arg r "$running" --arg p "$pkg" --arg v "$ver" --argjson d "$days" \
+            '{running:$r, package:$p, installed_version:$v, days_since_install:$d}')"
 }
 
 # SUID / SGID inventory, with delta against a baseline if one exists.
 probe_suid() {
-    local current count added removed baseline
+    local current count=0 added=0 removed=0 baseline added_sample=''
     baseline="$BASELINE_DIR/suid.txt"
     current=$(find /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /opt -xdev \
               \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null \
               | LC_ALL=C sort -u)
     count=$(printf '%s\n' "$current" | grep -c . || true)
-    added=0
-    removed=0
     if [[ -s "$baseline" ]]; then
         added=$(comm -23 <(printf '%s\n' "$current") "$baseline" 2>/dev/null | grep -c . || true)
         removed=$(comm -13 <(printf '%s\n' "$current") "$baseline" 2>/dev/null | grep -c . || true)
+        added_sample=$(comm -23 <(printf '%s\n' "$current") "$baseline" 2>/dev/null | head -3 | paste -sd, -)
     fi
     local sev='ok'
     (( added > 0 ))  && sev='warn'
     (( added > 3 ))  && sev='critical'
-    printf '{"count":%s,"added_since_baseline":%s,"removed_since_baseline":%s,"baseline_present":%s,"severity":"%s"}' \
-        "$count" "$added" "$removed" "$([[ -s $baseline ]] && echo true || echo false)" "$sev"
+    local present=false
+    [[ -s "$baseline" ]] && present=true
+    local status="$count suid/sgid binaries"
+    local message
+    if [[ "$present" == "false" ]]; then
+        message="No baseline yet ($count suid/sgid binaries currently). Set one with: cp $baseline.new $baseline after reviewing."
+        sev='info'
+        # Save the current list as a candidate baseline for the operator to promote.
+        printf '%s\n' "$current" > "$baseline.new"
+    elif (( added == 0 && removed == 0 )); then
+        message="$count suid/sgid binaries, matches baseline exactly."
+    else
+        message="$count suid/sgid binaries; $added added vs baseline"
+        [[ -n "$added_sample" ]] && message="$message ($added_sample)"
+        (( removed > 0 )) && message="$message, $removed removed"
+        message="$message."
+    fi
+    emit_probe "$sev" "$status" "$message" \
+        "$(jq -n --argjson c "$count" --argjson a "$added" --argjson r "$removed" \
+                 --arg present "$present" --arg sample "$added_sample" \
+            '{count:$c, added_since_baseline:$a, removed_since_baseline:$r,
+              baseline_present:($present == "true"), added_sample:$sample}')"
 }
 
-# SSH hardening: file present? PasswordAuthentication, PermitRootLogin.
+# SSH hardening: effective settings for PasswordAuthentication and
+# PermitRootLogin. Strategy (highest fidelity first):
+#   1. `sshd -T -f <config>` prints the effective config including
+#      defaults. Needs hostkey access so usually fails as a non-root
+#      user; we try it anyway in case the operator has dropped to a
+#      keyless test config.
+#   2. Grep the literal config file. Includes drop-ins under
+#      sshd_config.d/* in include order.
+#   3. Fall back to documented OpenSSH defaults when neither path set
+#      an explicit value. PasswordAuthentication defaults to yes, and
+#      PermitRootLogin has defaulted to prohibit-password since 7.0.
+#      We mark the source so the operator can see we are inferring.
 probe_ssh() {
-    local cfg=/etc/ssh/sshd_config password=unknown root=unknown installed=0
-    if [[ -r "$cfg" ]]; then
-        installed=1
-        if grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+no' "$cfg"; then password=no; \
-        elif grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' "$cfg"; then password=yes; fi
-        if grep -qE '^[[:space:]]*PermitRootLogin[[:space:]]+no' "$cfg"; then root=no; \
-        elif grep -qE '^[[:space:]]*PermitRootLogin[[:space:]]+(yes|prohibit-password|without-password)' "$cfg"; then root=yes; fi
+    local cfg=/etc/ssh/sshd_config password='' root='' installed=0
+    local sshd_active=0 source='none'
+    [[ -r "$cfg" ]] && installed=1
+    systemctl is-active --quiet sshd.service && sshd_active=1
+
+    if command -v sshd >/dev/null 2>&1; then
+        local eff
+        eff=$(sshd -T -f "$cfg" 2>/dev/null || true)
+        if [[ -n "$eff" ]]; then
+            source='sshd -T'
+            password=$(printf '%s\n' "$eff" | awk 'tolower($1) == "passwordauthentication" {print $2; exit}')
+            root=$(printf '%s\n'     "$eff" | awk 'tolower($1) == "permitrootlogin"        {print $2; exit}')
+        fi
     fi
-    local sev='info'
-    [[ $installed -eq 1 ]] && sev='ok'
-    [[ $password == 'yes' ]] && sev='warn'
-    [[ $root == 'yes' ]] && sev='critical'
-    printf '{"sshd_present":%s,"password_auth":"%s","permit_root_login":"%s","severity":"%s"}' \
-        "$installed" "$password" "$root" "$sev"
+
+    # Grep the literal config (and drop-ins) when sshd -T did not give
+    # us a value.
+    if [[ -z "$password" || -z "$root" ]] && [[ -r "$cfg" ]]; then
+        local configs=("$cfg")
+        if [[ -d /etc/ssh/sshd_config.d ]]; then
+            while IFS= read -r f; do configs+=("$f"); done < <(find /etc/ssh/sshd_config.d -maxdepth 1 -type f -name '*.conf' | LC_ALL=C sort)
+        fi
+        for f in "${configs[@]}"; do
+            if [[ -z "$password" ]]; then
+                local pv
+                pv=$(awk '/^[[:space:]]*PasswordAuthentication[[:space:]]+/ {print $2}' "$f" 2>/dev/null | tail -1)
+                [[ -n "$pv" ]] && password="$pv"
+            fi
+            if [[ -z "$root" ]]; then
+                local rv
+                rv=$(awk '/^[[:space:]]*PermitRootLogin[[:space:]]+/ {print $2}' "$f" 2>/dev/null | tail -1)
+                [[ -n "$rv" ]] && root="$rv"
+            fi
+        done
+        [[ "$source" == 'none' ]] && source='sshd_config'
+    fi
+
+    # Document defaults when no source set the field explicitly. Source
+    # for these: OpenSSH manpage (sshd_config(5)).
+    if [[ -z "$password" ]]; then password='yes'; source="$source+defaults"; fi
+    if [[ -z "$root"     ]]; then root='prohibit-password'; source="${source%+defaults}+defaults"; fi
+
+    local sev message status
+    if (( installed == 0 )); then
+        sev='info'
+        status='sshd not present'
+        message='OpenSSH server config not found; sshd is not installed on this host.'
+    elif (( sshd_active == 0 )); then
+        sev='ok'
+        status="sshd present, not running (source: $source)"
+        message="sshd_config present at $cfg, sshd.service is not active. Effective config (via $source): PasswordAuthentication=$password, PermitRootLogin=$root."
+    else
+        # sshd is running, so the effective settings matter to the score.
+        sev='ok'
+        status="sshd active, password=$password, root=$root"
+        message="sshd is running (source: $source). PasswordAuthentication=$password, PermitRootLogin=$root."
+        if [[ "$password" == 'yes' ]]; then
+            sev='warn'
+            message="$message PasswordAuthentication=yes weakens brute-force resistance; switch to key-based auth."
+        fi
+        case "$root" in
+            yes)
+                sev='critical'
+                message="$message Root login is permitted directly; set PermitRootLogin no." ;;
+            prohibit-password|without-password|forced-commands-only)
+                : ;;  # acceptable (key-only or restricted)
+        esac
+    fi
+    emit_probe "$sev" "$status" "$message" \
+        "$(jq -n --argjson p "$installed" --argjson active "$sshd_active" \
+                 --arg pw "$password" --arg root "$root" --arg src "$source" \
+            '{sshd_config_present:($p == 1), sshd_active:($active == 1),
+              password_auth:$pw, permit_root_login:$root, source:$src}')"
 }
 
 # Days since the last full system upgrade. Reads pacman log for the
 # most recent "starting full system upgrade" event.
 probe_last_upgrade() {
-    local days=999 last
+    local days=-1 last=''
     if [[ -r /var/log/pacman.log ]]; then
         last=$(grep -aE 'starting full system upgrade' /var/log/pacman.log 2>/dev/null \
                | tail -1 | sed -E 's/^\[([^]]+)\].*/\1/')
@@ -316,7 +634,17 @@ probe_last_upgrade() {
     local sev='ok'
     (( days > 14 )) && sev='warn'
     (( days > 30 )) && sev='critical'
-    printf '{"days":%s,"severity":"%s"}' "$days" "$sev"
+    local status='' message=''
+    if (( days < 0 )); then
+        sev='warn'
+        status='no upgrade record found'
+        message='Could not find any "starting full system upgrade" entry in /var/log/pacman.log.'
+    else
+        status="last pacman -Syu: $days day(s) ago"
+        message="Last full system upgrade ran $days day(s) ago (at $last)."
+    fi
+    emit_probe "$sev" "$status" "$message" \
+        "$(jq -n --argjson d "$days" --arg at "$last" '{days:$d, at:$at}')"
 }
 
 # Aggregate to a worst severity.
@@ -376,7 +704,7 @@ fetch_nvd() {
     now=$(date -u +%Y-%m-%dT%H:%M:%S.000)
     seven_ago=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%S.000)
     local url="https://services.nvd.nist.gov/rest/json/cves/2.0?pubStartDate=${seven_ago}&pubEndDate=${now}&resultsPerPage=2000"
-    if curl -fsSL --max-time 45 -A 'security-pulse/0.2' "$url" -o "$out.new" 2>>"$LOG"; then
+    if curl -fsSL --max-time 45 -A 'pulse/0.2' "$url" -o "$out.new" 2>>"$LOG"; then
         mv "$out.new" "$out"
         log "nvd fetch ok"
         return 0
@@ -419,7 +747,7 @@ fetch_epss() {
     else
         url="https://api.first.org/data/v1/epss?order=!epss&limit=200"
     fi
-    if curl -fsSL --max-time 30 -A 'security-pulse/0.2' "$url" -o "$out.new" 2>>"$LOG"; then
+    if curl -fsSL --max-time 30 -A 'pulse/0.2' "$url" -o "$out.new" 2>>"$LOG"; then
         mv "$out.new" "$out"
         log "epss fetch ok"
         return 0
@@ -453,13 +781,27 @@ compute_relevant() {
     local installed_names
     installed_names=$(jq -r '.[].name' "$INSTALLED" 2>/dev/null | LC_ALL=C sort -u)
 
+    # Set of CVE ids that Arch upstream has already patched. Cross-
+    # referenced against every feed below so a CVE Arch has shipped a
+    # fix for never re-surfaces as critical. The user's box is one
+    # pacman -Syu away from current at any point.
+    local fixed_cves='[]'
+    if [[ -s "$STATE/arch.json" ]]; then
+        fixed_cves=$(jq '[.[] | select(.status == "Fixed" or .status == "Not affected") | (.issues // [])[]] | unique' "$STATE/arch.json" 2>>"$LOG" || echo '[]')
+    fi
+
     if [[ -z "$installed_names" ]]; then
         echo '{"updated":"'"$(date -Iseconds)"'","items":[]}' > "$RELEVANT.new"
         mv "$RELEVANT.new" "$RELEVANT"
         return
     fi
 
-    # Arch ALSA items map cleanly onto pacman package names.
+    # Arch ALSA items map cleanly onto pacman package names. Status
+    # filter is the most important line in this function: ALSA marks
+    # an advisory "Fixed" once Arch ships a patched package version,
+    # and on a current system the installed version is past that fix.
+    # Including Fixed/Not-affected entries was the source of the
+    # composite-score false positives.
     local arch_items='[]'
     if [[ -s "$STATE/arch.json" ]]; then
         arch_items=$(jq --argjson floor "$floor_rank" \
@@ -472,9 +814,11 @@ compute_relevant() {
                 elif s == "Low"      then 1
                 else 0 end;
             [.[] | select(.packages != null)
+                | select(.status != "Fixed" and .status != "Not affected")
                 | . as $a
                 | .packages[]
-                | select((($inst[0]) | index(.)) != null) as $pkg
+                | . as $pkg
+                | select(($inst[0] | index($pkg)) != null)
                 | select(sev_rank($a.severity) >= $floor)
                 | {
                     source: "arch",
@@ -496,13 +840,14 @@ compute_relevant() {
     # require package names >= 4 chars and word-boundary equality to
     # avoid spurious matches like "go" in "Google". Older-than-cutoff
     # entries are out of the relevance bucket (still queryable via
-    # `security-pulse cves --kev`).
+    # `pulse cves --kev`).
     local kev_cutoff
     kev_cutoff=$(date -u -d "$CFG_kev_max_age_days days ago" +%Y-%m-%d)
     local kev_items='[]'
     if [[ -s "$STATE/kev.json" ]]; then
         kev_items=$(jq \
             --arg cutoff "$kev_cutoff" \
+            --argjson fixed "$fixed_cves" \
             --slurpfile inst <(jq '[.[].name | select(length >= 4)]' "$INSTALLED") \
             '
             def tokens(s):
@@ -511,6 +856,7 @@ compute_relevant() {
                 | split(" ") | map(select(length > 0)) | unique;
             [.vulnerabilities[]
                 | select((.dateAdded // "1970-01-01") >= $cutoff)
+                | select(($fixed | index(.cveID)) == null)
                 | . as $v
                 | (tokens($v.product) + tokens($v.vendorProject)) as $toks
                 | (($inst[0]) | map(select((. | ascii_downcase) as $p | ($toks | index($p)) != null))) as $hits
@@ -543,6 +889,7 @@ compute_relevant() {
     if [[ -s "$STATE/nvd.json" ]]; then
         nvd_items=$(jq --argjson floor "$floor_rank" \
             --arg cutoff "$nvd_cutoff" \
+            --argjson fixed "$fixed_cves" \
             --slurpfile inst <(jq '[.[].name | select(length >= 4)]' "$INSTALLED") \
             '
             def sev_rank(s):
@@ -553,6 +900,7 @@ compute_relevant() {
                 else 0 end;
             [.vulnerabilities[]? | .cve as $c
                 | select(($c.published // "1970") >= $cutoff)
+                | select(($fixed | index($c.id)) == null)
                 | (($c.metrics.cvssMetricV31 // [])[0].cvssData.baseSeverity // "") as $sev
                 | select(sev_rank($sev) >= $floor)
                 | (

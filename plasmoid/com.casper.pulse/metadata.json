@@ -3,17 +3,17 @@
     "KPlugin": {
         "Authors": [
             {
-                "Email": "ctavityan@gmail.com",
-                "Name": "Kaspar Tavitian"
+                "Email": "labs@venode.ai",
+                "Name": "Venode Labs"
             }
         ],
         "Category": "System Information",
         "Description": "Local system security health, composite risk score, threat feeds (CISA KEV, Arch ALSA, NVD, GHSA, EPSS) and CVE correlation against installed packages.",
         "Icon": "security-high",
-        "Id": "com.casper.securitypulse",
-        "Name": "Security Pulse",
-        "Version": "0.2.0",
-        "Website": ""
+        "Id": "com.casper.pulse",
+        "Name": "Pulse",
+        "Version": "0.3.0",
+        "Website": "https://github.com/keletonik/pulse"
     },
     "X-Plasma-API-Minimum-Version": "6.0"
 }

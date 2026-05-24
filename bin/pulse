@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
-# Security Pulse command-line interface.
+# pulse. Read-only CLI over the collector's JSON state. Status, CVE
+# list, config edit, suid baseline. No daemon, no network of its own.
 #
-# Read-only shell over the JSON the collector writes. Lets you check
-# status, list CVEs that match installed packages, edit config, and
-# manage the SUID baseline without leaving the terminal.
-#
-# Author: Kaspar Tavitian
+# (c) Venode Labs. MIT.
 
 set -u
 
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/security-pulse"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/security-pulse"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/pulse"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pulse"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
-COLLECTOR="$HOME/.local/bin/security-pulse-collector"
+COLLECTOR="$HOME/.local/bin/pulse-collector"
 BASELINE_DIR="$CONFIG_DIR/baselines"
 
 VERSION='0.2.0'
@@ -42,14 +39,14 @@ sev_colour() {
 
 require_jq() {
     if ! command -v jq >/dev/null 2>&1; then
-        echo "security-pulse: jq is required (pacman -S jq)" >&2
+        echo "pulse: jq is required (pacman -S jq)" >&2
         exit 1
     fi
 }
 
 require_state() {
     if [[ ! -s "$STATE/health.json" ]]; then
-        echo "security-pulse: no state yet. Run 'security-pulse run' or wait for the timer."
+        echo "pulse: no state yet. Run 'pulse run' or wait for the timer."
         exit 1
     fi
 }
@@ -178,7 +175,7 @@ cmd_cves() {
         --kev)      mode='kev' ;;
         --relevant) mode='relevant' ;;
         '')         ;;
-        *)          echo "usage: security-pulse cves [--relevant|--all|--kev]"; exit 2 ;;
+        *)          echo "usage: pulse cves [--relevant|--all|--kev]"; exit 2 ;;
     esac
 
     case "$mode" in
@@ -292,7 +289,7 @@ EOF
         .items // []
         | .[0:20]
         | .[]
-        | "- **\(.severity // "?")** \(.id) on \(.package). \(.title // .id)" +
+        | "- **\(.severity // "?")** \(.id) on \(.package) — \(.title // .id)" +
           (if .url then " (\(.url))" else "" end)
     ' "$STATE/relevant.json"
 }
@@ -334,15 +331,15 @@ cmd_run() {
 }
 
 cmd_version() {
-    echo "security-pulse $VERSION"
+    echo "pulse $VERSION"
 }
 
 cmd_help() {
     cat <<'EOF'
-security-pulse, local view onto your Security Pulse state.
+pulse — local view onto your Security Pulse state.
 
 usage:
-  security-pulse [command] [args]
+  pulse [command] [args]
 
 commands:
   status                  one-line score plus the local health rundown (default)

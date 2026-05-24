@@ -23,7 +23,7 @@ score_history_days = 30
 relevant_cap = 50
 
 # Recency window for relevance, in days. KEV entries older than this
-# are still queryable via `security-pulse cves --kev`, but they do not
+# are still queryable via `pulse cves --kev`, but they do not
 # count toward the composite-score penalty or the desktop alert. A 2010
 # Linux kernel CVE is not actionable for a 2026 kernel; this filter is
 # what turns the firehose into something a human can react to.
