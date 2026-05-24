@@ -1,0 +1,31 @@
+name: Feature or improvement
+description: An idea, not a bug.
+labels: ['enhancement']
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: |
+        What is the situation today that isn't working for you?
+        Be concrete. 'It would be nice if' is a weak signal.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like
+      description: |
+        Your proposal. A rough sketch is fine; this is not a spec.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Other things you tried or thought about.
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Links, screenshots, related projects.

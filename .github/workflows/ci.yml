@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck on shell sources
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          shellcheck -x \
+            install.sh uninstall.sh \
+            bin/security-pulse bin/security-pulse-collector
+
+  qml:
+    name: qmllint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt6 QML tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y qml6-module-qtquick qml6-module-qtquick-controls qt6-declarative-dev-tools
+      - name: Lint plasmoid QML
+        run: |
+          for f in plasmoid/contents/ui/*.qml; do
+            qmllint6 "$f" || qmllint "$f"
+          done
+
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Anti-fingerprint scan
+        run: |
+          # The same scan the venode repo runs. Keep in sync. Markers
+          # are unambiguous AI fingerprints, not generic vocab.
+          PATTERNS='AI generated|Generated with Claude|Co-authored-by: *Claude|as an AI|as a language model'
+          if git grep -nE "$PATTERNS" -- \
+              ':(exclude,glob)*.md' \
+              ':(exclude,glob)**/*.md' \
+              ':(exclude,glob).github/**' \
+              2>/dev/null; then
+            echo
+            echo "Anti-fingerprint scan found tells in tracked files."
+            exit 1
+          fi
+          echo "clean."
