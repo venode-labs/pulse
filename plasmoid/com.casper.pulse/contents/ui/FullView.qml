@@ -483,8 +483,8 @@ Item {
                             // Hover anywhere on the row shows the same
                             // text as the expand-on-click would, so the
                             // operator does not need to commit a click.
-                            QQC.ToolTip.visible: hover.containsMouse && !!modelData.value.message
-                            QQC.ToolTip.text: modelData.value.message || ""
+                            QQC.ToolTip.visible: hover.containsMouse === true && !!(modelData && modelData.value && modelData.value.message)
+                            QQC.ToolTip.text: (modelData && modelData.value && modelData.value.message) || ""
                             QQC.ToolTip.delay: 400
 
                             HoverHandler { id: hover }
