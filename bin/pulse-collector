@@ -64,6 +64,7 @@ load_config() {
     CFG_nvd_max_age_days=30
     CFG_llm_endpoint=
     CFG_llm_token=
+    CFG_listening_allowlist=
 
     [[ -r "$CONFIG_FILE" ]] || return 0
     local line key val
@@ -98,6 +99,13 @@ load_config() {
                 ;;
             llm_token)
                 [[ "$val" =~ ^[A-Za-z0-9._-]+$ ]] && CFG_llm_token="$val"
+                ;;
+            listening_allowlist)
+                # Comma-separated list of process names allowed to listen externally.
+                # Values must be alphanumeric plus hyphen, underscore, dot.
+                if [[ "$val" =~ ^[A-Za-z0-9_.,\-]+$ ]]; then
+                    CFG_listening_allowlist="$val"
+                fi
                 ;;
         esac
     done < "$CONFIG_FILE"
@@ -612,7 +620,7 @@ probe_ssh() {
     emit_probe "$sev" "$status" "$message" \
         "$(jq -n --argjson p "$installed" --argjson active "$sshd_active" \
                  --arg pw "$password" --arg root "$root" --arg src "$source" \
-            '{sshd_config_present:($p == 1), sshd_active:($active == 1),
+            '{sshd_present:($p == 1), sshd_active:($active == 1),
               password_auth:$pw, permit_root_login:$root, source:$src}')"
 }
 
@@ -926,7 +934,51 @@ compute_relevant() {
             ' "$STATE/nvd.json" 2>>"$LOG" || echo '[]')
     fi
 
-    # Merge, de-dup by id+package, sort by severity then recency, cap.
+    # GHSA: match on advisory packages list using the same word-boundary rule.
+    local ghsa_cutoff
+    ghsa_cutoff=$(date -u -d "$CFG_nvd_max_age_days days ago" +%Y-%m-%dT%H:%M:%SZ)
+    local ghsa_items='[]'
+    if [[ -s "$STATE/ghsa.json" ]]; then
+        ghsa_items=$(jq --argjson floor "$floor_rank" \
+            --arg cutoff "$ghsa_cutoff" \
+            --argjson fixed "$fixed_cves" \
+            --slurpfile inst <(jq '[.[].name | select(length >= 4)]' "$INSTALLED") \
+            '
+            def sev_rank(s):
+                if (s // "") | ascii_downcase | startswith("crit") then 4
+                elif (s // "") | ascii_downcase | startswith("high") then 3
+                elif (s // "") | ascii_downcase | startswith("med") then 2
+                elif (s // "") | ascii_downcase | startswith("low") then 1
+                else 0 end;
+            [.[]
+                | select((.published_at // "1970") >= $cutoff)
+                | select(.cve_id != null)
+                | select(($fixed | index(.cve_id)) == null)
+                | select(sev_rank(.severity) >= $floor)
+                | . as $a
+                | ((.packages // []) | map(.name // "") | map(ascii_downcase)) as $pkg_names
+                | (($inst[0]) | map(select((. | ascii_downcase) as $p | ($pkg_names | index($p)) != null))) as $hits
+                | select(($hits | length) > 0)
+                | {
+                    source: "ghsa",
+                    id: $a.cve_id,
+                    ghsa_id: $a.ghsa_id,
+                    package: $hits[0],
+                    severity: ($a.severity // "Unknown"),
+                    status: "Disclosed",
+                    advisories: [$a.ghsa_id],
+                    cves: [$a.cve_id],
+                    title: ($a.summary // $a.ghsa_id),
+                    url: ($a.html_url // ("https://github.com/advisories/" + $a.ghsa_id)),
+                    published: $a.published_at
+                  }
+            ]
+            ' "$STATE/ghsa.json" 2>>"$LOG" || echo '[]')
+    fi
+
+    # Merge all four feeds, de-dup by CVE ID (not id+package to ensure true
+    # cross-feed dedup: a CVE appearing in both KEV and NVD surfaces once,
+    # preferring the entry with the higher-priority source -- KEV > arch > NVD > GHSA).
     local items
     items=$(jq -s --argjson cap "$cap" \
         '
@@ -936,12 +988,19 @@ compute_relevant() {
             elif (s | ascii_downcase) | startswith("med") then 2
             elif (s | ascii_downcase) | startswith("low") then 1
             else 0 end;
-        (.[0] + .[1] + .[2])
-        | group_by(.id + "|" + .package)
+        def src_priority(s):
+            if s == "kev"  then 4
+            elif s == "arch" then 3
+            elif s == "nvd"  then 2
+            else 1 end;
+        (.[0] + .[1] + .[2] + .[3])
+        | sort_by(- src_priority(.source))
+        | group_by(.id)
         | map(.[0])
         | sort_by(- sev_score(.severity), -((.added // .published // "") | tostring | length))
         | .[0:$cap]
-        ' <(printf '%s' "$arch_items") <(printf '%s' "$kev_items") <(printf '%s' "$nvd_items") 2>>"$LOG" || echo '[]')
+        ' <(printf '%s' "$arch_items") <(printf '%s' "$kev_items") \
+          <(printf '%s' "$nvd_items")  <(printf '%s' "$ghsa_items") 2>>"$LOG" || echo '[]')
 
     # Splice EPSS probabilities onto matching CVE rows.
     if [[ -s "$STATE/epss.json" ]]; then
@@ -1082,14 +1141,19 @@ maybe_brief() {
     [[ -s "$RELEVANT" ]] || return 0
 
     local payload
-    payload=$(jq -c '{
-        ask: "Three sentences. Plain English. Worst-first. What should the user fix on this machine today, given this Security Pulse snapshot? No marketing language.",
-        snapshot: {
-            score: (input | .score),
-            health: (input | .items),
-            top_relevant: (input | .items[0:5])
-        }
-    }' "$SCORE" <(jq '{score:.score, items:.items[0:0]}' "$SCORE") "$RELEVANT" 2>>"$LOG" || echo '{}')
+    payload=$(jq -cn \
+        --slurpfile score   "$SCORE" \
+        --slurpfile health  "$HEALTH" \
+        --slurpfile relevant "$RELEVANT" \
+        '{
+            ask: "Three sentences. Plain English. Worst-first. What should the user fix on this machine today, given this Security Pulse snapshot? No marketing language.",
+            snapshot: {
+                score:        ($score[0].score),
+                health_score: ($score[0].health_score),
+                health:       ($health[0].items),
+                top_relevant: ($relevant[0].items[0:5])
+            }
+        }' 2>>"$LOG" || echo '{}')
 
     curl -fsSL --max-time 25 -X POST \
         -H "Authorization: Bearer $CFG_llm_token" \

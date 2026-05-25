@@ -58,6 +58,26 @@ require_state() {
 cmd_status() {
     require_jq
     require_state
+    local json=0
+    [[ "${1:-}" == '--json' ]] && json=1
+
+    if (( json == 1 )); then
+        jq -n \
+            --slurpfile score   "$STATE/score.json" \
+            --slurpfile health  "$STATE/health.json" \
+            --slurpfile relevant "$STATE/relevant.json" \
+            '{
+                composite:    $score[0].score,
+                health:       $health[0].score,
+                overall:      $health[0].overall,
+                host:         $health[0].host,
+                updated:      $health[0].updated,
+                relevant_cves:$relevant[0].count,
+                probes:       $health[0].items
+            }'
+        return
+    fi
+
     local sc he sev host updated comp relevant
     sc=$(jq -r '.score // 0' "$STATE/score.json" 2>/dev/null || echo 0)
     he=$(jq -r '.score // 0' "$STATE/health.json")
@@ -110,19 +130,19 @@ short_detail() {
     local key="$1"; shift
     local j="$*"
     case "$key" in
-        firewall)        jq -r '"\(.engine) " + (if .active==1 then "active" else "inactive" end)' <<< "$j" ;;
-        apparmor)        jq -r 'if .active==1 then "enforcing" else "inactive" end' <<< "$j" ;;
-        usbguard)        jq -r 'if .installed==1 then (if .active==1 then "active" else "installed, off" end) else "not installed" end' <<< "$j" ;;
+        firewall)        jq -r '"\(.engine) " + (if .active then "active" else "inactive" end)' <<< "$j" ;;
+        apparmor)        jq -r 'if .active then "enforcing" else "inactive" end' <<< "$j" ;;
+        usbguard)        jq -r 'if .installed then (if .active then "active" else "installed, off" end) else "not installed" end' <<< "$j" ;;
         updates)         jq -r '"\(.total) pending" + (if .kernel_pending==1 then ", kernel" else "" end)' <<< "$j" ;;
         secureboot)      jq -r '.state' <<< "$j" ;;
         tpm)             jq -r 'if .present==1 then "present" else "absent" end' <<< "$j" ;;
         luks)            jq -r 'if .present==1 then "encrypted volume present" else "no LUKS volume" end' <<< "$j" ;;
         failed_logins)   jq -r '"\(.count_24h) in 24h"' <<< "$j" ;;
         listening_ports) jq -r '"\(.external_listeners) external listener(s)"' <<< "$j" ;;
-        vpn)             jq -r 'if .active==1 then "tunnel up" else "no tunnel" end' <<< "$j" ;;
+        vpn)             jq -r 'if .active then "tunnel up" else "no tunnel" end' <<< "$j" ;;
         kernel)          jq -r '"\(.running), installed \(.days_since_install)d ago"' <<< "$j" ;;
         suid)            jq -r '"\(.count) suid bins, +\(.added_since_baseline) / -\(.removed_since_baseline) since baseline"' <<< "$j" ;;
-        ssh)             jq -r 'if .sshd_present==1 then "sshd present (password=\(.password_auth), root=\(.permit_root_login))" else "no sshd" end' <<< "$j" ;;
+        ssh)             jq -r 'if .sshd_present then "sshd present (password=\(.password_auth), root=\(.permit_root_login))" else "no sshd" end' <<< "$j" ;;
         last_upgrade)    jq -r '"\(.days) days since last -Syu"' <<< "$j" ;;
         *)               printf '%s' "$j" ;;
     esac
@@ -326,6 +346,92 @@ cmd_config() {
     cat "$CONFIG_FILE"
 }
 
+SNAPSHOT_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/pulse/snapshots"
+
+cmd_diff() {
+    require_jq
+    require_state
+    local snap
+    snap=$(ls -1t "$SNAPSHOT_DIR"/*.json 2>/dev/null | head -1)
+    if [[ -z "$snap" ]]; then
+        echo "pulse diff: no snapshot found. Run 'pulse snap' first to capture a baseline."
+        exit 1
+    fi
+
+    local cur_score prev_score cur_overall prev_overall
+    cur_score=$(jq -r '.score // 0' "$STATE/score.json" 2>/dev/null || echo 0)
+    cur_overall=$(jq -r '.overall // "unknown"' "$STATE/health.json" 2>/dev/null)
+    prev_score=$(jq -r '.composite // 0' "$snap" 2>/dev/null || echo 0)
+    prev_overall=$(jq -r '.overall // "unknown"' "$snap" 2>/dev/null)
+    local snap_ts
+    snap_ts=$(jq -r '.taken // ""' "$snap" 2>/dev/null)
+
+    printf '%sSnapshot%s  %s\n' "$C_BOLD" "$C_RESET" "${snap_ts:0:19}"
+    printf '%sScore%s     %s -> %s%s%s\n' "$C_BOLD" "$C_RESET" \
+        "$prev_score" "$(sev_colour "$cur_overall")" "$cur_score" "$C_RESET"
+    printf '%sOverall%s   %s -> %s%s%s\n\n' "$C_BOLD" "$C_RESET" \
+        "$prev_overall" "$(sev_colour "$cur_overall")" "$cur_overall" "$C_RESET"
+
+    # Per-probe severity diff
+    local prev_probes cur_probes
+    prev_probes=$(jq -c '.probes // {}' "$snap" 2>/dev/null)
+    cur_probes=$(jq -c '.items // {}' "$STATE/health.json" 2>/dev/null)
+    local changed=0
+    while IFS= read -r key; do
+        local prev_sev cur_sev
+        prev_sev=$(printf '%s' "$prev_probes" | jq -r --arg k "$key" '.[$k].severity // "?"')
+        cur_sev=$(printf '%s' "$cur_probes"  | jq -r --arg k "$key" '.[$k].severity // "?"')
+        if [[ "$prev_sev" != "$cur_sev" ]]; then
+            printf '  %-18s  %s%s%s -> %s%s%s\n' "$key" \
+                "$(sev_colour "$prev_sev")" "$prev_sev" "$C_RESET" \
+                "$(sev_colour "$cur_sev")"  "$cur_sev"  "$C_RESET"
+            changed=$(( changed + 1 ))
+        fi
+    done < <(printf '%s' "$cur_probes" | jq -r 'keys[]')
+    (( changed == 0 )) && printf '  no probe severity changes\n'
+
+    # New CVEs since snapshot
+    local prev_cve_ids cur_cve_ids new_cves
+    prev_cve_ids=$(jq -r '.relevant_ids // [] | .[]' "$snap" 2>/dev/null | sort -u)
+    cur_cve_ids=$(jq -r '.items[].id // empty' "$STATE/relevant.json" 2>/dev/null | sort -u)
+    new_cves=$(comm -23 <(printf '%s\n' "$cur_cve_ids") <(printf '%s\n' "$prev_cve_ids") 2>/dev/null | grep -c . || true)
+    if (( new_cves > 0 )); then
+        printf '\n  %s%s new relevant CVE(s) since snapshot%s\n' "$C_AMBER" "$new_cves" "$C_RESET"
+        comm -23 <(printf '%s\n' "$cur_cve_ids") <(printf '%s\n' "$prev_cve_ids") \
+          | head -10 \
+          | while IFS= read -r id; do
+                local sev
+                sev=$(jq -r --arg id "$id" \
+                    '[.items[] | select(.id == $id)] | .[0].severity // "?"' \
+                    "$STATE/relevant.json" 2>/dev/null)
+                printf '    %s%-9s%s  %s\n' "$(sev_colour "$sev")" "$sev" "$C_RESET" "$id"
+            done
+    fi
+}
+
+cmd_snap() {
+    require_jq
+    require_state
+    install -d "$SNAPSHOT_DIR"
+    local ts file
+    ts=$(date -Iseconds)
+    file="$SNAPSHOT_DIR/$(date +%Y%m%dT%H%M%S).json"
+    jq -n \
+        --slurpfile score   "$STATE/score.json" \
+        --slurpfile health  "$STATE/health.json" \
+        --slurpfile relevant "$STATE/relevant.json" \
+        --arg taken "$ts" \
+        '{
+            taken:         $taken,
+            composite:     $score[0].score,
+            overall:       $health[0].overall,
+            probes:        $health[0].items,
+            relevant_count:$relevant[0].count,
+            relevant_ids:  ($relevant[0].items | map(.id) | unique)
+        }' > "$file"
+    echo "snapshot saved to $file"
+}
+
 cmd_run() {
     "$COLLECTOR"
 }
@@ -336,13 +442,14 @@ cmd_version() {
 
 cmd_help() {
     cat <<'EOF'
-pulse — local view onto your Security Pulse state.
+pulse - local view onto your Security Pulse state.
 
 usage:
   pulse [command] [args]
 
 commands:
-  status                  one-line score plus the local health rundown (default)
+  status [--json]         one-line score plus the local health rundown (default).
+                          --json emits machine-readable JSON.
   health                  full local health detail
   score                   composite score, breakdown, history sparkline
   cves [--relevant|--all|--kev]
@@ -350,6 +457,8 @@ commands:
                           installed packages.
   feeds                   show which threat feeds have recent data
   report                  markdown report of current state
+  snap                    save a timestamped snapshot of the current state
+  diff                    compare current state to the most recent snapshot
   set-baseline            snapshot SUID inventory so the next run detects drift
   notify-test             fire a sample desktop notification
   config [--edit|--path]  show, edit, or print the path to config.toml
@@ -378,6 +487,8 @@ case "$cmd" in
     set-baseline|baseline) cmd_set_baseline "$@" ;;
     notify-test)   cmd_notify_test "$@" ;;
     config)        cmd_config "$@" ;;
+    snap|snapshot) cmd_snap "$@" ;;
+    diff)          cmd_diff "$@" ;;
     run|run-now)   cmd_run "$@" ;;
     version|--version|-v) cmd_version ;;
     help|--help|-h) cmd_help ;;

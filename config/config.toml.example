@@ -30,6 +30,11 @@ relevant_cap = 50
 kev_max_age_days = 365
 nvd_max_age_days = 30
 
+# Comma-separated list of process names allowed to bind externally.
+# Appended to the built-in allowlist (sshd, systemd-resolved, avahi-daemon, etc).
+# Example: listening_allowlist = kdeconnectd,syncthing
+listening_allowlist =
+
 # Optional Hugo Cloud briefing. Leave endpoint blank to disable.
 # When set, the collector POSTs a short prompt to Hugo and stores the
 # reply under briefing.json. No data leaves your box if endpoint is blank.

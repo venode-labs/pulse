@@ -84,7 +84,7 @@ Item {
             case "vpn":             return v.active ? "tunnel up" : "no tunnel";
             case "kernel":          return v.running + " · " + v.days_since_install + "d since install";
             case "suid":            return v.count + " bins · +" + v.added_since_baseline + " / -" + v.removed_since_baseline + " vs baseline";
-            case "ssh":             return v.sshd_present
+            case "ssh":             return (v.sshd_present || v.sshd_config_present)
                                         ? ("sshd present (password=" + v.password_auth + ", root=" + v.permit_root_login + ")")
                                         : "no sshd";
             case "last_upgrade":    return v.days + " days since last -Syu";
@@ -309,6 +309,23 @@ Item {
                                     text: modelData.package
                                     color: Kirigami.Theme.disabledTextColor
                                     Layout.fillWidth: true
+                                }
+                                // KEV badge when the entry came from CISA KEV.
+                                QQC.Label {
+                                    visible: modelData.source === "kev" || modelData.status === "KnownExploited"
+                                    text: "KEV"
+                                    color: "#d32f2f"
+                                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                                    font.bold: true
+                                }
+                                // EPSS exploitation probability when available.
+                                QQC.Label {
+                                    visible: modelData.epss !== undefined && modelData.epss !== null
+                                    text: (modelData.epss !== undefined && modelData.epss !== null)
+                                        ? ("EPSS " + (modelData.epss * 100).toFixed(1) + "%")
+                                        : ""
+                                    color: Kirigami.Theme.disabledTextColor
+                                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                                 }
                                 QQC.Label {
                                     text: modelData.severity || ""
