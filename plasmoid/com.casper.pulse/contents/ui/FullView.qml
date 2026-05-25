@@ -21,9 +21,9 @@ Item {
 
     signal refreshRequested()
 
-    Layout.preferredWidth:  Kirigami.Units.gridUnit * 28
+    Layout.preferredWidth:  Kirigami.Units.gridUnit * 32
     Layout.preferredHeight: Kirigami.Units.gridUnit * 38
-    implicitWidth:  Kirigami.Units.gridUnit * 28
+    implicitWidth:  Kirigami.Units.gridUnit * 32
     implicitHeight: Kirigami.Units.gridUnit * 38
 
     // -----------------------------------------------------------------
@@ -203,11 +203,11 @@ Item {
         QQC.TabBar {
             id: tabs
             Layout.fillWidth: true
-            QQC.TabButton { text: "Overview" }
-            QQC.TabButton { text: "Threats"  }
-            QQC.TabButton { text: "Local"    }
-            QQC.TabButton { text: "History"  }
-            QQC.TabButton { text: "Settings" }
+            QQC.TabButton { text: "Overview"; width: tabs.width / 5 }
+            QQC.TabButton { text: "Threats";  width: tabs.width / 5 }
+            QQC.TabButton { text: "Local";    width: tabs.width / 5 }
+            QQC.TabButton { text: "History";  width: tabs.width / 5 }
+            QQC.TabButton { text: "Settings"; width: tabs.width / 5 }
         }
 
         StackLayout {
