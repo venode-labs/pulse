@@ -25,6 +25,19 @@ Item {
     implicitWidth:  Kirigami.Units.gridUnit * 28
     implicitHeight: Kirigami.Units.gridUnit * 38
 
+    // Off-screen TextEdit used as clipboard sink.
+    TextEdit {
+        id: clipHelper
+        visible: false
+        width: 1; height: 1
+    }
+
+    function copyToClipboard(str) {
+        clipHelper.text = str;
+        clipHelper.selectAll();
+        clipHelper.copy();
+    }
+
     // -----------------------------------------------------------------
     // Helpers
 
@@ -198,12 +211,10 @@ Item {
                                 var end   =  Math.PI * 0.75;
                                 ctx.lineCap = "round";
                                 ctx.lineWidth = 9;
-                                // track
                                 ctx.strokeStyle = Kirigami.Theme.alternateBackgroundColor;
                                 ctx.beginPath();
                                 ctx.arc(cx, cy, r, start, end);
                                 ctx.stroke();
-                                // value
                                 var frac = Math.max(0, Math.min(1, score / 100));
                                 ctx.strokeStyle = scoreColour(score);
                                 ctx.beginPath();
@@ -290,8 +301,12 @@ Item {
                             : []
                         spacing: Kirigami.Units.smallSpacing
                         delegate: ColumnLayout {
+                            id: ovCveRow
                             width: ListView.view.width
                             spacing: 2
+
+                            property bool rowHovered: false
+                            HoverHandler { onHoveredChanged: ovCveRow.rowHovered = hovered }
 
                             RowLayout {
                                 Layout.fillWidth: true
@@ -300,17 +315,25 @@ Item {
                                     Layout.preferredHeight: Kirigami.Units.gridUnit
                                     color: severityColour(modelData.severity)
                                 }
-                                QQC.Label {
+                                // Selectable CVE ID
+                                TextEdit {
                                     text: modelData.id
                                     font.family: "Geist Mono, monospace"
                                     font.bold: true
+                                    color: Kirigami.Theme.textColor
+                                    readOnly: true
+                                    selectByMouse: true
+                                    wrapMode: Text.NoWrap
                                 }
-                                QQC.Label {
+                                // Selectable package name
+                                TextEdit {
                                     text: modelData.package
                                     color: Kirigami.Theme.disabledTextColor
+                                    readOnly: true
+                                    selectByMouse: true
+                                    wrapMode: Text.NoWrap
                                     Layout.fillWidth: true
                                 }
-                                // KEV badge when the entry came from CISA KEV.
                                 QQC.Label {
                                     visible: modelData.source === "kev" || modelData.status === "KnownExploited"
                                     text: "KEV"
@@ -318,7 +341,6 @@ Item {
                                     font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                                     font.bold: true
                                 }
-                                // EPSS exploitation probability when available.
                                 QQC.Label {
                                     visible: modelData.epss !== undefined && modelData.epss !== null
                                     text: (modelData.epss !== undefined && modelData.epss !== null)
@@ -333,11 +355,26 @@ Item {
                                     font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                                     font.bold: true
                                 }
+                                // Compact copy button: appears on row hover
+                                QQC.ToolButton {
+                                    visible: ovCveRow.rowHovered
+                                    icon.name: "edit-copy"
+                                    flat: true
+                                    implicitWidth:  Kirigami.Units.iconSizes.small
+                                    implicitHeight: Kirigami.Units.iconSizes.small
+                                    onClicked: full.copyToClipboard(modelData.id + " " + modelData.package)
+                                    QQC.ToolTip.text: "Copy ID"
+                                    QQC.ToolTip.visible: hovered
+                                    QQC.ToolTip.delay: 600
+                                }
                             }
-                            QQC.Label {
+                            // Selectable title
+                            TextEdit {
                                 text: modelData.title || ""
                                 color: Kirigami.Theme.disabledTextColor
                                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                                readOnly: true
+                                selectByMouse: true
                                 wrapMode: Text.Wrap
                                 Layout.fillWidth: true
                             }
@@ -397,15 +434,24 @@ Item {
                             return [];
                         }
                         delegate: ColumnLayout {
+                            id: threatRow
                             width: ListView.view.width
                             spacing: 2
 
+                            property bool rowHovered: false
+                            HoverHandler { onHoveredChanged: threatRow.rowHovered = hovered }
+
                             RowLayout {
                                 Layout.fillWidth: true
-                                QQC.Label {
+                                // Selectable CVE ID
+                                TextEdit {
                                     text: modelData.cve || modelData.id
                                     font.family: "Geist Mono, monospace"
                                     font.bold: true
+                                    color: Kirigami.Theme.textColor
+                                    readOnly: true
+                                    selectByMouse: true
+                                    wrapMode: Text.NoWrap
                                 }
                                 QQC.Label {
                                     text: modelData.added || modelData.published || ""
@@ -414,8 +460,21 @@ Item {
                                     horizontalAlignment: Text.AlignRight
                                     font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                                 }
+                                // Copy button: visible on hover
+                                QQC.ToolButton {
+                                    visible: threatRow.rowHovered
+                                    icon.name: "edit-copy"
+                                    flat: true
+                                    implicitWidth:  Kirigami.Units.iconSizes.small
+                                    implicitHeight: Kirigami.Units.iconSizes.small
+                                    onClicked: full.copyToClipboard(modelData.cve || modelData.id)
+                                    QQC.ToolTip.text: "Copy ID"
+                                    QQC.ToolTip.visible: hovered
+                                    QQC.ToolTip.delay: 600
+                                }
                             }
-                            QQC.Label {
+                            // Selectable vendor / packages line
+                            TextEdit {
                                 text: {
                                     if (modelData.vendor) return modelData.vendor + " · " + modelData.product;
                                     if (modelData.packages) return (modelData.packages || []).join(", ");
@@ -424,10 +483,17 @@ Item {
                                 }
                                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                                 color: Kirigami.Theme.disabledTextColor
+                                readOnly: true
+                                selectByMouse: true
+                                wrapMode: Text.NoWrap
                             }
-                            QQC.Label {
+                            // Selectable description
+                            TextEdit {
                                 text: modelData.name || modelData.title || modelData.summary || ""
+                                readOnly: true
+                                selectByMouse: true
                                 wrapMode: Text.Wrap
+                                color: Kirigami.Theme.textColor
                                 Layout.fillWidth: true
                             }
                         }
@@ -451,13 +517,13 @@ Item {
                         model: itemEntries()
                         spacing: 0
                         delegate: ColumnLayout {
+                            id: probeRow
                             width: ListView.view.width
                             spacing: 0
 
-                            // Hover-to-expand: the row shows just the
-                            // probe's `status` line; clicking the row
-                            // reveals the longer `message` underneath.
                             property bool expanded: false
+                            property bool rowHovered: false
+                            HoverHandler { onHoveredChanged: probeRow.rowHovered = hovered }
 
                             RowLayout {
                                 Layout.fillWidth: true
@@ -472,24 +538,46 @@ Item {
                                     text: prettyKey(modelData.key)
                                     Layout.preferredWidth: Kirigami.Units.gridUnit * 10
                                 }
-                                QQC.Label {
+                                // Selectable probe status / detail
+                                TextEdit {
                                     text: modelData.value.status
                                         || detail(modelData.key, modelData.value)
                                     color: Kirigami.Theme.disabledTextColor
-                                    Layout.fillWidth: true
-                                    elide: Text.ElideRight
+                                    readOnly: true
+                                    selectByMouse: true
                                     wrapMode: Text.NoWrap
+                                    Layout.fillWidth: true
+                                    clip: true
                                 }
+                                // Expand button for longer message
                                 QQC.ToolButton {
                                     visible: !!modelData.value.message
-                                    text: parent.parent.expanded ? "−" : "+"
+                                    text: probeRow.expanded ? "−" : "+"
                                     flat: true
-                                    onClicked: parent.parent.expanded = !parent.parent.expanded
+                                    onClicked: probeRow.expanded = !probeRow.expanded
+                                }
+                                // Copy button: probe + detail on hover
+                                QQC.ToolButton {
+                                    visible: probeRow.rowHovered
+                                    icon.name: "edit-copy"
+                                    flat: true
+                                    implicitWidth:  Kirigami.Units.iconSizes.small
+                                    implicitHeight: Kirigami.Units.iconSizes.small
+                                    onClicked: full.copyToClipboard(
+                                        prettyKey(modelData.key) + ": " +
+                                        (modelData.value.status || detail(modelData.key, modelData.value))
+                                    )
+                                    QQC.ToolTip.text: "Copy"
+                                    QQC.ToolTip.visible: hovered
+                                    QQC.ToolTip.delay: 600
                                 }
                             }
-                            QQC.Label {
-                                visible: parent.expanded && !!modelData.value.message
+                            // Selectable expanded message
+                            TextEdit {
+                                visible: probeRow.expanded && !!modelData.value.message
                                 text: modelData.value.message || ""
+                                readOnly: true
+                                selectByMouse: true
                                 wrapMode: Text.WordWrap
                                 Layout.fillWidth: true
                                 Layout.leftMargin: Kirigami.Units.gridUnit + Kirigami.Units.smallSpacing
@@ -497,14 +585,11 @@ Item {
                                 color: Kirigami.Theme.textColor
                                 font.pixelSize: Kirigami.Units.gridUnit * 0.85
                             }
-                            // Hover anywhere on the row shows the same
-                            // text as the expand-on-click would, so the
-                            // operator does not need to commit a click.
-                            QQC.ToolTip.visible: hover.containsMouse === true && !!(modelData && modelData.value && modelData.value.message)
+                            QQC.ToolTip.visible: probeHover.containsMouse === true && !!(modelData && modelData.value && modelData.value.message)
                             QQC.ToolTip.text: (modelData && modelData.value && modelData.value.message) || ""
                             QQC.ToolTip.delay: 400
 
-                            HoverHandler { id: hover }
+                            HoverHandler { id: probeHover }
                         }
                     }
                 }
@@ -539,18 +624,15 @@ Item {
                         var ctx = getContext("2d");
                         ctx.reset();
                         if (!points.length) return;
-                        // Padding
                         var pl = 4, pr = 4, pt = 6, pb = 14;
                         var w = width - pl - pr;
                         var h = height - pt - pb;
-                        // Track baseline
                         ctx.strokeStyle = Kirigami.Theme.alternateBackgroundColor;
                         ctx.lineWidth = 1;
                         ctx.beginPath();
                         ctx.moveTo(pl, pt + h);
                         ctx.lineTo(pl + w, pt + h);
                         ctx.stroke();
-                        // Plot
                         ctx.strokeStyle = scoreColour(points[points.length - 1].score);
                         ctx.fillStyle = ctx.strokeStyle;
                         ctx.lineWidth = 2;
@@ -562,14 +644,12 @@ Item {
                             else ctx.lineTo(x, y);
                         }
                         ctx.stroke();
-                        // Fill under the curve, soft
                         ctx.globalAlpha = 0.12;
                         ctx.lineTo(pl + w, pt + h);
                         ctx.lineTo(pl, pt + h);
                         ctx.closePath();
                         ctx.fill();
                         ctx.globalAlpha = 1;
-                        // Tick: latest
                         ctx.fillStyle = Kirigami.Theme.disabledTextColor;
                         ctx.font = "10px sans-serif";
                         ctx.fillText(points[0].score + "", pl, pt + h + 10);
@@ -595,11 +675,15 @@ Item {
                         spacing: 0
                         delegate: RowLayout {
                             width: ListView.view.width
-                            QQC.Label {
+                            // Selectable timestamp
+                            TextEdit {
                                 text: (modelData.at || "").substring(0, 19).replace("T", " ")
                                 font.family: "Geist Mono, monospace"
                                 color: Kirigami.Theme.disabledTextColor
                                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                                readOnly: true
+                                selectByMouse: true
+                                wrapMode: Text.NoWrap
                                 Layout.fillWidth: true
                             }
                             QQC.Label {
